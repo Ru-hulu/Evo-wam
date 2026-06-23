@@ -8,7 +8,10 @@ import torch
 import torch.nn as nn
 from model.internvl3.internvl3_embedder import InternVL3Embedder
 from model.action_head.flow_matching import FlowmatchingActionHead
+from model.action_head.dit_action_head import FlowmatchingDiTActionHead
 import logging
+
+
 class EVO1(nn.Module):
     def __init__(self, config: dict):
         super().__init__()
@@ -20,22 +23,18 @@ class EVO1(nn.Module):
 
         action_head_type = config.get("action_head", "flowmatching").lower()
         
+        horizon = config.get("action_horizon", config.get("horizon", 16))
+        per_action_dim = config.get("per_action_dim", 7)
+        action_dim = horizon * per_action_dim
+        
+        config["horizon"] = horizon
+        config["per_action_dim"] = per_action_dim
+        config["action_dim"] = action_dim
+        
+        self.horizon = horizon
+        self.per_action_dim = per_action_dim
+
         if action_head_type == "flowmatching":
-           
-            horizon = config.get("action_horizon", config.get("horizon", 16))
-            per_action_dim = config.get("per_action_dim", 7)
-            action_dim = horizon * per_action_dim
-            
-            config["horizon"] = horizon
-            config["per_action_dim"] = per_action_dim
-            config["action_dim"] = action_dim
-            
-            if action_dim != horizon * per_action_dim:
-                raise ValueError(f"action_dim ({action_dim}) ≠ horizon ({horizon}) × per_action_dim ({per_action_dim})")
-
-            self.horizon = horizon
-            self.per_action_dim = per_action_dim
-
             self.action_head = FlowmatchingActionHead(config=SimpleNamespace(
                 embed_dim=config.get("embed_dim", 896),  # README MetaWorld: 896
                 hidden_dim=config.get("hidden_dim", 1024),  # README MetaWorld: 1024
@@ -49,6 +48,25 @@ class EVO1(nn.Module):
                 dropout=config.get("dropout", 0.0),  # README MetaWorld stage1/stage2: 0.2
                 num_inference_timesteps=config.get("num_inference_timesteps", 50),  # README MetaWorld: 50
                 num_categories=config.get("num_categories", 1)  # README MetaWorld: 1
+            )).to(self._device)
+        elif action_head_type == "dit":
+            self.action_head = FlowmatchingDiTActionHead(config=SimpleNamespace(
+                embed_dim=config.get("embed_dim", 896),
+                hidden_dim=config.get("hidden_dim", 1024),
+                ffn_dim=config.get("dit_ffn_dim", None),
+                action_dim=action_dim,
+                horizon=horizon,
+                per_action_dim=per_action_dim,
+                state_dim=config.get("state_dim", 7),
+                state_hidden_dim=config.get("state_hidden_dim", 1024),
+                num_heads=24, # 和 wan2.2 兼容
+                attn_head_dim=128, # 和 wan2.2 兼容
+                num_layers=10,
+                dropout=config.get("dropout", 0.0),
+                num_inference_timesteps=config.get("num_inference_timesteps", 50),
+                num_categories=config.get("num_categories", 1),
+                freq_dim=config.get("dit_freq_dim", 256),
+                eps=config.get("dit_eps", 1e-6),
             )).to(self._device)
         else:
             raise NotImplementedError(f"Unknown action_head: {action_head_type}")

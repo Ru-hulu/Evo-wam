@@ -546,7 +546,12 @@ if __name__ == "__main__":
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--run_name", type=str, default="default_run")
     parser.add_argument("--vlm_name", type=str, default="OpenGVLab/InternVL3-1B")
-    parser.add_argument("--action_head", type=str, default="flowmatching", choices=["flowmatching"])
+    parser.add_argument(
+        "--action_head",
+        type=str,
+        default="flowmatching",
+        choices=["flowmatching", "dit"],
+    )
     parser.add_argument("--return_cls_only", action="store_true")
     parser.add_argument("--disable_wandb", action="store_true", help="Disable wandb logging.")
 
@@ -587,6 +592,9 @@ if __name__ == "__main__":
     parser.add_argument("--state_dim", type=int, default=7)
     parser.add_argument("--horizon", type=int, default=16)
     parser.add_argument("--num_layers", type=int, default=8)
+    parser.add_argument("--dit_ffn_dim", type=int, default=None)
+    parser.add_argument("--dit_freq_dim", type=int, default=256)
+    parser.add_argument("--dit_eps", type=float, default=1e-6)
     parser.add_argument("--num_workers", type=int, default=4)
     # dropout
     parser.add_argument("--dropout", type=float, default=0.0)
@@ -600,4 +608,3 @@ if __name__ == "__main__":
         if accelerator.is_main_process:
             logging.info("KeyboardInterrupt received. Cleaning up...")
         sys.exit(0)
-
