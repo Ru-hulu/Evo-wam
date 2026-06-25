@@ -1,5 +1,5 @@
 from types import SimpleNamespace
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
@@ -159,10 +159,48 @@ class DiTBlock(nn.Module):
         )
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
 
-            # action_tokens: [8, 50, 1024]
-            # context: [8, 1025, 1024] （fused_tokens + state token）
-            # t_mod:   [8, 6, 1024]
-            # freqs:   [50, 64]
+    def build_attention_io(
+        self,
+        x: torch.Tensor,  # action_tokens: [8, 50, 1024]
+        t_mod: torch.Tensor,  # [8, 6, 1024]
+        freqs: torch.Tensor,  # [50, 64]
+    ) -> dict:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
+        ).chunk(6, dim=1)
+
+        attn_input = modulate(self.norm1(x), shift_msa, scale_msa)
+        q = apply_rope(self.self_attn.norm_q(self.self_attn.q(attn_input)), freqs, self.self_attn.num_heads)
+        k = apply_rope(self.self_attn.norm_k(self.self_attn.k(attn_input)), freqs, self.self_attn.num_heads)
+        v = self.self_attn.v(attn_input)
+
+        return {
+            "q": q,  # [B, 50, 3072]
+            "k": k,  # [B, 50, 3072]
+            "v": v,  # [B, 50, 3072]
+            "residual_x": x,  # [B, 50, 1024]
+            "gate_msa": gate_msa,  # [B, 1, 1024]
+            "shift_mlp": shift_mlp,  # [B, 1, 1024]
+            "scale_mlp": scale_mlp,  # [B, 1, 1024]
+            "gate_mlp": gate_mlp,  # [B, 1, 1024]
+        }
+
+    def apply_post_attention(
+        self,
+        residual_x: torch.Tensor,  # [B, 50, 1024]
+        mixed_attn_out: torch.Tensor,  # [B, 50, 3072]
+        gate_msa: torch.Tensor,  # [B, 1, 1024]
+        shift_mlp: torch.Tensor,  # [B, 1, 1024]
+        scale_mlp: torch.Tensor,  # [B, 1, 1024]
+        gate_mlp: torch.Tensor,  # [B, 1, 1024]
+        context: torch.Tensor,  # [B, 1025, 1024]
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        x = residual_x + gate_msa * self.self_attn.o(mixed_attn_out)
+        x = x + self.cross_attn(self.norm3(x), context, context_mask=context_mask)
+        x = x + gate_mlp * self.ffn(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
     def forward(
         self,
         x: torch.Tensor,      # action_tokens: [8, 50, 1024]
@@ -172,19 +210,24 @@ class DiTBlock(nn.Module):
         context_mask: Optional[torch.Tensor] = None,
         self_attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.modulation.to(dtype=t_mod.dtype, device=t_mod.device) + t_mod
-        ).chunk(6, dim=1)
-
-        x = x + gate_msa * self.self_attn(
-            modulate(self.norm1(x), shift_msa, scale_msa),
-            freqs,
-            self_attn_mask=self_attn_mask,
-        ) # 先带上频率信息，知道50 个action token 之间的先后关系
-        x = x + self.cross_attn(self.norm3(x), context, context_mask=context_mask)
-        # 然后再和context进行查询操作。
-        x = x + gate_mlp * self.ffn(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
+        action_io = self.build_attention_io(x, t_mod, freqs)
+        mixed_attn_out = scaled_dot_product_attention(
+            action_io["q"],
+            action_io["k"],
+            action_io["v"],
+            self.self_attn.num_heads,
+            attn_mask=self_attn_mask,
+        )
+        return self.apply_post_attention(
+            residual_x=action_io["residual_x"],
+            mixed_attn_out=mixed_attn_out,
+            gate_msa=action_io["gate_msa"],
+            shift_mlp=action_io["shift_mlp"],
+            scale_mlp=action_io["scale_mlp"],
+            gate_mlp=action_io["gate_mlp"],
+            context=context,
+            context_mask=context_mask,
+        )
 
 
 class FlowmatchingDiTActionHead(nn.Module):
@@ -450,20 +493,62 @@ class FlowmatchingDiTActionHead(nn.Module):
     def run_dit_blocks(
         self,
         action_tokens: torch.Tensor,  # [B, 50, 1024]
-        context: torch.Tensor,  # [B, 1025, 1024]
+        context: torch.Tensor,  # [B, 1025, 1024] （fused_tokens + state token）
         t_mod: torch.Tensor,  # [B, 6, 1024]
         freqs: torch.Tensor,  # [50, 64]
         start_layer: int = 0,
         end_layer: Optional[int] = None,
+        global_attention_fn: Optional[Callable] = None,
     ) -> torch.Tensor:
         end_layer = len(self.blocks) if end_layer is None else end_layer
-        for block in self.blocks[start_layer:end_layer]:
-            action_tokens = block(action_tokens, context, t_mod, freqs)
-            # action_tokens: [8, 50, 1024]
-            # context: [8, 1025, 1024] （fused_tokens + state token）
-            # t_mod:   [8, 6, 1024]
-            # freqs:   [50, 64]
+        for layer_idx, block in enumerate(self.blocks[start_layer:end_layer], start=start_layer):
+            if global_attention_fn is None:
+                action_tokens = block(action_tokens, context, t_mod, freqs)
+            else:
+                action_io = block.build_attention_io(action_tokens, t_mod, freqs)
+                mixed_attn_out = global_attention_fn(
+                    layer_idx=layer_idx,
+                    action_io=action_io,
+                )
+                action_tokens = block.apply_post_attention(
+                    residual_x=action_io["residual_x"],
+                    mixed_attn_out=mixed_attn_out,
+                    gate_msa=action_io["gate_msa"],
+                    shift_mlp=action_io["shift_mlp"],
+                    scale_mlp=action_io["scale_mlp"],
+                    gate_mlp=action_io["gate_mlp"],
+                    context=context,
+                )
         return action_tokens
+
+    def build_layer_attention_io(
+        self,
+        layer_idx: int,
+        action_tokens: torch.Tensor,  # [B, 50, 1024]
+        t_mod: torch.Tensor,  # [B, 6, 1024]
+        freqs: torch.Tensor,  # [50, 64]
+    ) -> dict:
+        return self.blocks[layer_idx].build_attention_io(action_tokens, t_mod, freqs)
+
+    def apply_layer_post_attention(
+        self,
+        layer_idx: int,
+        action_io: dict,
+        mixed_attn_out: torch.Tensor,  # [B, 50, 3072]
+        context: torch.Tensor,  # [B, 1025, 1024]
+        context_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        block = self.blocks[layer_idx]
+        return block.apply_post_attention(
+            residual_x=action_io["residual_x"],
+            mixed_attn_out=mixed_attn_out,
+            gate_msa=action_io["gate_msa"],
+            shift_mlp=action_io["shift_mlp"],
+            scale_mlp=action_io["scale_mlp"],
+            gate_mlp=action_io["gate_mlp"],
+            context=context,
+            context_mask=context_mask,
+        )
 
     def post_dit(
         self,
