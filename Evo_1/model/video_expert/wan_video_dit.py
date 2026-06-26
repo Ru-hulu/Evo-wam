@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import logging
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Callable, Dict, Tuple, Optional
 from einops import rearrange
 from .helpers.gradient import gradient_checkpoint_forward
 
@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
     
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, ctx_mask: Optional[torch.Tensor] = None, compatibility_mode=True):
     if compatibility_mode:
-        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
+        q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)# [B, 360, 3072]->[B, 24, 360, 128]
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)
         x = F.scaled_dot_product_attention(q, k, v, attn_mask=ctx_mask)
@@ -233,9 +233,12 @@ class DiTBlock(nn.Module):
         self.modulation = nn.Parameter(torch.randn(1, 6, hidden_dim) / hidden_dim**0.5)
         self.gate = GateModule()
 
-    def forward(self, x, context, t_mod, freqs, context_mask=None, self_attn_mask: Optional[torch.Tensor] = None):
-        if context_mask is not None and context_mask.dim() == 3:
-            context_mask = context_mask.unsqueeze(1) # (B, 1, seq_len, context_len), 1 for heads
+    def build_attention_io(
+        self,
+        x: torch.Tensor,  # [B, 360, 3072]
+        t_mod: torch.Tensor,  # [B, 360, 6, 3072]
+        freqs: torch.Tensor,  # [360, 1, 64]
+    ) -> Dict[str, torch.Tensor]:
         has_seq = len(t_mod.shape) == 4
         chunk_dim = 2 if has_seq else 1
         # msa: multi-head self-attention  mlp: multi-layer perceptron
@@ -254,15 +257,60 @@ class DiTBlock(nn.Module):
             )
             # 变成6个[B, 360, 3072]
             # x 自身的维度就是[B, 360, 3072]
-        x = self.gate(x, gate_msa, self.self_attn(
-            modulate(self.norm1(x), shift_msa, scale_msa),
-            freqs,
-            self_attn_mask=self_attn_mask,
-        ))
+        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        q = rope_apply(self.self_attn.norm_q(self.self_attn.q(input_x)), freqs, self.self_attn.num_heads)
+        k = rope_apply(self.self_attn.norm_k(self.self_attn.k(input_x)), freqs, self.self_attn.num_heads)
+        v = self.self_attn.v(input_x)
+
+        return {
+            "q": q,  # [B, 360, 3072]
+            "k": k,  # [B, 360, 3072]
+            "v": v,  # [B, 360, 3072]
+            "residual_x": x,  # [B, 360, 3072]
+            "gate_msa": gate_msa,  # [B, 360, 3072]
+            "shift_mlp": shift_mlp,  # [B, 360, 3072]
+            "scale_mlp": scale_mlp,  # [B, 360, 3072]
+            "gate_mlp": gate_mlp,  # [B, 360, 3072]
+        }
+
+    def apply_post_attention(
+        self,
+        residual_x: torch.Tensor,  # [B, 360, 3072]
+        mixed_attn_out: torch.Tensor,  # [B, 360, 3072]
+        gate_msa: torch.Tensor,  # [B, 360, 3072]
+        shift_mlp: torch.Tensor,  # [B, 360, 3072]
+        scale_mlp: torch.Tensor,  # [B, 360, 3072]
+        gate_mlp: torch.Tensor,  # [B, 360, 3072]
+        context: torch.Tensor,  # [B, text_len, 3072]
+        context_mask: Optional[torch.Tensor] = None,  # [B, 360, text_len]
+    ) -> torch.Tensor:
+        if context_mask is not None and context_mask.dim() == 3:
+            context_mask = context_mask.unsqueeze(1) # (B, 1, seq_len, context_len), 1 for heads
+        x = self.gate(residual_x, gate_msa, self.self_attn.o(mixed_attn_out))
         x = x + self.cross_attn(self.norm3(x), context, ctx_mask=context_mask)
         input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
         x = self.gate(x, gate_mlp, self.ffn(input_x))
         return x
+
+    def forward(self, x, context, t_mod, freqs, context_mask=None, self_attn_mask: Optional[torch.Tensor] = None):
+        video_io = self.build_attention_io(x, t_mod, freqs)
+        mixed_attn_out = flash_attention(
+            q=video_io["q"],
+            k=video_io["k"],
+            v=video_io["v"],
+            num_heads=self.self_attn.num_heads,
+            ctx_mask=self_attn_mask,
+        )
+        return self.apply_post_attention(
+            residual_x=video_io["residual_x"],
+            mixed_attn_out=mixed_attn_out,
+            gate_msa=video_io["gate_msa"],
+            shift_mlp=video_io["shift_mlp"],
+            scale_mlp=video_io["scale_mlp"],
+            gate_mlp=video_io["gate_mlp"],
+            context=context,
+            context_mask=context_mask,
+        )
 
 
 class Head(nn.Module):
@@ -610,6 +658,86 @@ class WanVideoDiT(torch.nn.Module):
         x = self.unpatchify(x, (f, h, w))
         return x
 
+    def run_dit_blocks(
+        self,
+        x_tokens: torch.Tensor,  # [B, 360, 3072]
+        context: torch.Tensor,  # [B, text_len, 3072]
+        t_mod: torch.Tensor,  # [B, 360, 6, 3072]
+        freqs: torch.Tensor,  # [360, 1, 64]
+        context_attn_mask: Optional[torch.Tensor] = None,  # [B, 360, text_len]
+        self_attn_mask: Optional[torch.Tensor] = None,  # [360, 360] or None
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
+        global_attention_fn: Optional[Callable] = None,
+    ) -> torch.Tensor:
+        end_layer = len(self.blocks) if end_layer is None else end_layer
+        for layer_idx, block in enumerate(self.blocks[start_layer:end_layer], start=start_layer):
+            if global_attention_fn is None:
+                if self.use_gradient_checkpointing:
+                    x_tokens = gradient_checkpoint_forward(
+                        block,
+                        self.use_gradient_checkpointing,
+                        x_tokens, context, t_mod, freqs,
+                        context_mask=context_attn_mask,
+                        self_attn_mask=self_attn_mask,
+                    )
+                else:
+                    x_tokens = block(
+                        x_tokens,
+                        context,
+                        t_mod,
+                        freqs,
+                        context_mask=context_attn_mask,
+                        self_attn_mask=self_attn_mask,
+                    )
+            else:
+                video_io = block.build_attention_io(x_tokens, t_mod, freqs)
+                mixed_attn_out = global_attention_fn(
+                    layer_idx=layer_idx,
+                    video_io=video_io,
+                    self_attn_mask=self_attn_mask,
+                )
+                x_tokens = block.apply_post_attention(
+                    residual_x=video_io["residual_x"],
+                    mixed_attn_out=mixed_attn_out,
+                    gate_msa=video_io["gate_msa"],
+                    shift_mlp=video_io["shift_mlp"],
+                    scale_mlp=video_io["scale_mlp"],
+                    gate_mlp=video_io["gate_mlp"],
+                    context=context,
+                    context_mask=context_attn_mask,
+                )
+        return x_tokens
+
+    def build_layer_attention_io(
+        self,
+        layer_idx: int,
+        x_tokens: torch.Tensor,  # [B, 360, 3072]
+        t_mod: torch.Tensor,  # [B, 360, 6, 3072]
+        freqs: torch.Tensor,  # [360, 1, 64]
+    ) -> dict:
+        return self.blocks[layer_idx].build_attention_io(x_tokens, t_mod, freqs)
+
+    def apply_layer_post_attention(
+        self,
+        layer_idx: int,
+        video_io: dict,
+        mixed_attn_out: torch.Tensor,  # [B, 360, 3072]
+        context: torch.Tensor,  # [B, text_len, 3072]
+        context_mask: Optional[torch.Tensor] = None,  # [B, 360, text_len]
+    ) -> torch.Tensor:
+        block = self.blocks[layer_idx]
+        return block.apply_post_attention(
+            residual_x=video_io["residual_x"],
+            mixed_attn_out=mixed_attn_out,
+            gate_msa=video_io["gate_msa"],
+            shift_mlp=video_io["shift_mlp"],
+            scale_mlp=video_io["scale_mlp"],
+            gate_mlp=video_io["gate_mlp"],
+            context=context,
+            context_mask=context_mask,
+        )
+
     def forward(
         self,
         x: torch.Tensor,  # 9-frame 384x320 video -> [B, 48, 3, 24, 20] 这里已经是VAE的输出了
@@ -639,14 +767,13 @@ class WanVideoDiT(torch.nn.Module):
             device=x_tokens.device,
         ) if self.video_attention_mask_mode != "bidirectional" else None # special rule for faster speed
 
-        for block in self.blocks:
-            if self.use_gradient_checkpointing:
-                x_tokens = gradient_checkpoint_forward(
-                    block,
-                    self.use_gradient_checkpointing,
-                    x_tokens, context_emb, t_mod, freqs, context_mask=context_attn_mask, self_attn_mask=self_attn_mask
-                )
-            else:
-                x_tokens = block(x_tokens, context_emb, t_mod, freqs, context_mask=context_attn_mask, self_attn_mask=self_attn_mask)
+        x_tokens = self.run_dit_blocks(
+            x_tokens=x_tokens,
+            context=context_emb,
+            t_mod=t_mod,
+            freqs=freqs,
+            context_attn_mask=context_attn_mask,
+            self_attn_mask=self_attn_mask,
+        )
 
         return self.post_dit(x_tokens, pre_state)
