@@ -441,7 +441,7 @@ class FlowmatchingDiTActionHead(nn.Module):
             state=state,
             embodiment_id=embodiment_id,
         )
-        action_tokens = self.run_dit_blocks(
+        action_tokens = self._run_dit_blocks_standalone(
             action_tokens=pre_state["action_tokens"],
             context=pre_state["context"],
             t_mod=pre_state["t_mod"],
@@ -496,29 +496,40 @@ class FlowmatchingDiTActionHead(nn.Module):
         context: torch.Tensor,  # [B, 1025, 1024] （fused_tokens + state token）
         t_mod: torch.Tensor,  # [B, 6, 1024]
         freqs: torch.Tensor,  # [50, 64]
+        global_attention_fn: Callable,
         start_layer: int = 0,
         end_layer: Optional[int] = None,
-        global_attention_fn: Optional[Callable] = None,
     ) -> torch.Tensor:
         end_layer = len(self.blocks) if end_layer is None else end_layer
         for layer_idx, block in enumerate(self.blocks[start_layer:end_layer], start=start_layer):
-            if global_attention_fn is None:
-                action_tokens = block(action_tokens, context, t_mod, freqs)
-            else:
-                action_io = block.build_attention_io(action_tokens, t_mod, freqs)
-                mixed_attn_out = global_attention_fn(
-                    layer_idx=layer_idx,
-                    action_io=action_io,
-                )
-                action_tokens = block.apply_post_attention(
-                    residual_x=action_io["residual_x"],
-                    mixed_attn_out=mixed_attn_out,
-                    gate_msa=action_io["gate_msa"],
-                    shift_mlp=action_io["shift_mlp"],
-                    scale_mlp=action_io["scale_mlp"],
-                    gate_mlp=action_io["gate_mlp"],
-                    context=context,
-                )
+            action_io = block.build_attention_io(action_tokens, t_mod, freqs)
+            mixed_attn_out = global_attention_fn(
+                layer_idx=layer_idx,
+                action_io=action_io,
+            )
+            action_tokens = block.apply_post_attention(
+                residual_x=action_io["residual_x"],
+                mixed_attn_out=mixed_attn_out,
+                gate_msa=action_io["gate_msa"],
+                shift_mlp=action_io["shift_mlp"],
+                scale_mlp=action_io["scale_mlp"],
+                gate_mlp=action_io["gate_mlp"],
+                context=context,
+            )
+        return action_tokens
+
+    def _run_dit_blocks_standalone(
+        self,
+        action_tokens: torch.Tensor,  # [B, 50, 1024]
+        context: torch.Tensor,  # [B, 1025, 1024] （fused_tokens + state token）
+        t_mod: torch.Tensor,  # [B, 6, 1024]
+        freqs: torch.Tensor,  # [50, 64]
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
+    ) -> torch.Tensor:
+        end_layer = len(self.blocks) if end_layer is None else end_layer
+        for block in self.blocks[start_layer:end_layer]:
+            action_tokens = block(action_tokens, context, t_mod, freqs)
         return action_tokens
 
     def build_layer_attention_io(
