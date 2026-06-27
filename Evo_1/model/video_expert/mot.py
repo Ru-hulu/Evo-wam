@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Any, Dict, Sequence
 
 import torch
 import torch.nn as nn
@@ -105,3 +105,144 @@ class FirstTableMoTLayer(nn.Module):
             "video": mixed[:, :video_len],
             "action": mixed[:, video_len:],
         }
+
+class SkipLayerVideoActionMoT(nn.Module):
+    """Coordinate video/action experts with video layers 3, 6, ..., 30 paired to action layers."""
+
+    def __init__(self, num_heads: int, video_layer_stride: int = 3):
+        super().__init__()
+        self.video_layer_stride = int(video_layer_stride)
+        if self.video_layer_stride <= 0:
+            raise ValueError(f"`video_layer_stride` must be positive, got {video_layer_stride}")
+        self.global_attention = FirstTableMoTLayer(num_heads=num_heads)
+
+    def forward(
+        self,
+        video_expert: nn.Module,
+        action_expert: nn.Module,
+        video_inputs: Dict[str, Any],
+        action_inputs: Dict[str, Any],
+        current_obs_token_counts: int | Sequence[int],
+        future_obs_token_counts: int | Sequence[int],
+        action_token_counts: int | Sequence[int],
+    ) -> Dict[str, torch.Tensor]:
+        video_pre_state = video_expert.pre_dit(**video_inputs)
+        action_pre_state = action_expert.pre_dit(**action_inputs)
+        return self.forward_prepared(
+            video_expert=video_expert,
+            action_expert=action_expert,
+            video_pre_state=video_pre_state,
+            action_pre_state=action_pre_state,
+            current_obs_token_counts=current_obs_token_counts,
+            future_obs_token_counts=future_obs_token_counts,
+            action_token_counts=action_token_counts,
+        )
+
+    def forward_prepared(
+        self,
+        video_expert: nn.Module,
+        action_expert: nn.Module,
+        video_pre_state: Dict[str, Any],
+        action_pre_state: Dict[str, Any],
+        current_obs_token_counts: int | Sequence[int],
+        future_obs_token_counts: int | Sequence[int],
+        action_token_counts: int | Sequence[int],
+    ) -> Dict[str, torch.Tensor]:
+        video_tokens = video_pre_state["tokens"]
+        action_tokens = action_pre_state["action_tokens"]
+        video_context = video_pre_state["context"]
+        action_context = action_pre_state["context"]
+        video_t_mod = video_pre_state["t_mod"]
+        action_t_mod = action_pre_state["t_mod"]
+        video_freqs = video_pre_state["freqs"]
+        action_freqs = action_pre_state["freqs"]
+        video_context_mask = video_pre_state.get("context_mask")
+        action_context_mask = action_pre_state.get("context_mask")
+
+        video_self_attn_mask = self._build_video_self_attn_mask(video_expert, video_tokens, video_pre_state)
+        # video_self_attn_mask = att.md
+        action_layer_idx = 0
+
+        for video_layer_idx in range(len(video_expert.blocks)):
+            if not self._is_global_video_layer(video_layer_idx):
+                video_tokens = video_expert.run_dit_blocks(
+                    x_tokens=video_tokens,
+                    context=video_context,
+                    t_mod=video_t_mod,
+                    freqs=video_freqs,
+                    context_attn_mask=video_context_mask,
+                    self_attn_mask=video_self_attn_mask,
+                    start_layer=video_layer_idx,
+                    end_layer=video_layer_idx + 1,
+                )
+                continue
+
+            if action_layer_idx >= len(action_expert.blocks):
+                raise ValueError(
+                    f"Video global layer {video_layer_idx + 1} has no matching action layer. "
+                    f"Check video_layer_stride={self.video_layer_stride} and action layer count."
+                )
+            video_io = video_expert.build_layer_attention_io(
+                layer_idx=video_layer_idx,
+                x_tokens=video_tokens,
+                t_mod=video_t_mod,
+                freqs=video_freqs,
+            )
+            action_io = action_expert.build_layer_attention_io(
+                layer_idx=action_layer_idx,
+                action_tokens=action_tokens,
+                t_mod=action_t_mod,
+                freqs=action_freqs,
+            )
+            mot_out = self.global_attention(
+                video_io=video_io,
+                action_io=action_io,
+                current_obs_token_counts=current_obs_token_counts,
+                future_obs_token_counts=future_obs_token_counts,
+                action_token_counts=action_token_counts,
+            )
+            video_tokens = video_expert.apply_layer_post_attention(
+                layer_idx=video_layer_idx,
+                video_io=video_io,
+                mixed_attn_out=mot_out["video"],
+                context=video_context,
+                context_mask=video_context_mask,
+            )
+            action_tokens = action_expert.apply_layer_post_attention(
+                layer_idx=action_layer_idx,
+                action_io=action_io,
+                mixed_attn_out=mot_out["action"],
+                context=action_context,
+                context_mask=action_context_mask,
+            )
+            action_layer_idx += 1
+
+        if action_layer_idx != len(action_expert.blocks):
+            raise ValueError(
+                f"Only consumed {action_layer_idx} action layers, expected {len(action_expert.blocks)}. "
+                f"Check video_layer_stride={self.video_layer_stride} and video/action layer counts."
+            )
+
+        return {
+            "video": video_expert.post_dit(video_tokens, video_pre_state),
+            "action": action_expert.post_dit(action_tokens, action_pre_state),
+            "video_tokens": video_tokens,
+            "action_tokens": action_tokens,
+        }
+
+    def _is_global_video_layer(self, zero_based_layer_idx: int) -> bool:
+        return (zero_based_layer_idx + 1) % self.video_layer_stride == 0
+
+    def _build_video_self_attn_mask(
+        self,
+        video_expert: nn.Module,
+        video_tokens: torch.Tensor,
+        video_pre_state: Dict[str, Any],
+    ) -> torch.Tensor | None:
+        if str(video_expert.video_attention_mask_mode) == "bidirectional":
+            return None
+        return video_expert.build_video_to_video_mask(
+            video_seq_len=video_tokens.shape[1],
+            video_tokens_per_frame=int(video_pre_state["meta"]["tokens_per_frame"]),
+            device=video_tokens.device,
+        )
