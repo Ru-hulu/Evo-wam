@@ -7,7 +7,6 @@ import time
 import numpy as np
 import traceback
 import torch
-import torchvision.transforms.functional as transforms_F
 from contextlib import contextmanager
 
 try:
@@ -64,7 +63,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         action_video_freq_ratio: int = 1,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
-        concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
+        concat_multi_camera: Optional[str] = None, # ignored: cameras are always kept independent
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
     ):
         self.lerobot_dataset = BaseLerobotDataset(
@@ -84,7 +83,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
         assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
             f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio)) # default len=33
+        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio)) # default len=9
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -94,7 +93,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.context_len = context_len
         self.skip_padding_as_possible = skip_padding_as_possible
         self.max_padding_retry = max_padding_retry
-        self.concat_multi_camera = concat_multi_camera
+        del concat_multi_camera
         self.override_instruction = override_instruction
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
@@ -136,6 +135,15 @@ class RobotVideoDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.lerobot_dataset)
 
+    def _resize_crop_normalize_video(self, video: torch.Tensor) -> torch.Tensor:
+        num_views, T_video, C, H, W = video.shape
+        video = video.reshape(num_views * T_video, C, H, W)  # default [num_views*T_video, 3, H, W]
+        video = self.resize_transform(video) # default [num_views*T_video, 3, H', W']
+        video = self.crop_transform(video) # default [num_views*T_video, 3, H_out, W_out]
+        video = self.normalize_transform(video)  # default [num_views*T_video, 3, H_out, W_out]
+        _, C, H, W = video.shape
+        return video.view(num_views, T_video, C, H, W)  # default [num_views, T_video, 3, H_out, W_out]
+
     def _get(self, idx):
         sample_idx = idx
         sample = None
@@ -148,7 +156,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             # -> BaseLerobotDataset._get_image    # 提取图像窗口：[33, 3, H, W]
             # -> BaseLerobotDataset._get_state    # 提取状态窗口：[33, raw_state_dim]
             # -> BaseLerobotDataset._get_action   # 提取动作窗口：[32, raw_action_dim]
-            # -> FastWAMProcessor.preprocess      # 图像处理 + 归一化 + concat/pad：pixel_values/action/proprio
+            # -> FastWAMProcessor.preprocess      # 图像处理 + 归一化 + pad：pixel_values/action/proprio
             if not self.skip_padding_as_possible:
                 break
 
@@ -171,72 +179,31 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         image_is_pad = sample["image_is_pad"] # default [33] 长度为 33 的 bool 向量，表示 33 帧图像/视频里哪些是 padding。
 
         video = sample["pixel_values"]  # default [num_cameras, 33, 3, H, W]
-        num_cameras = 1
         if video.ndim == 5: # 如果是多相机的情况
-            video = video[:, self.video_sample_indices, :, :, :] # default [num_cameras, 33, 3, H, W]
-            num_cameras, T_video, C, H, W = video.shape
+            video = video[:, self.video_sample_indices, :, :, :] # default [num_cameras, 9, 3, H, W]
         else:# 如果是单相机的情况
             assert video.ndim == 4, f"Expected video to have shape [T, C, H, W], but got {video.shape}"
-            video = video[self.video_sample_indices, :, :, :] # default [33, 3, H, W]
-            T_video, C, H, W = video.shape
-        image_is_pad = image_is_pad[self.video_sample_indices] # default [33] video_sample_indices 可能是0 2 4 6 这样的采样
+            video = video[self.video_sample_indices, :, :, :].unsqueeze(0) # default [1, 9, 3, H, W]
+        num_cameras, T_video, C, H, W = video.shape
+        image_is_pad = image_is_pad[self.video_sample_indices] # default [9] video_sample_indices 可能是0 4 8 这样的采样
 
-        video = video.view(num_cameras, T_video, C, H, W)  # default [num_cameras, 33, 3, H, W]
-        if self.concat_multi_camera == "robotwin":
-            if num_cameras != 3:
-                raise ValueError(
-                    f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
-                )
-            cam_top = transforms_F.resize(
-                video[0],
-                size=[256, 320],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 256, 320]
-            cam_left = transforms_F.resize(
-                video[1],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            cam_right = transforms_F.resize(
-                video[2],
-                size=[128, 160],
-                interpolation=transforms_F.InterpolationMode.BILINEAR,
-                antialias=True,
-            )  # [T_video, C, 128, 160]
-            bottom = torch.cat([cam_left, cam_right], dim=-1)  # [T_video, C, 128, 320]
-            video = torch.cat([cam_top, bottom], dim=-2)  # [T_video, C, 384, 320]
-        elif num_cameras > 1:
-            if self.concat_multi_camera == "horizontal":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-1)  # default [33, 3, H, num_cameras*W]
-            elif self.concat_multi_camera == "vertical":
-                video = torch.cat([video[i] for i in range(num_cameras)], dim=-2)  # default [33, 3, num_cameras*H, W]
-            else:
-                raise ValueError(
-                    f"Invalid concat_multi_camera: {self.concat_multi_camera}. "
-                    "Expected one of: horizontal, vertical, robotwin."
-                )
-        else:
-            video = video.squeeze(0)  # default [33, 3, H, W]
+        video = video.view(num_cameras, T_video, C, H, W)  # default [num_views, 9, 3, H, W]
 
         # final resize and normalization
-        video = self.resize_transform(video) # default [33, 3, H', W']
-        video = self.crop_transform(video) # default [33, 3, 384, 640]
-        video = self.normalize_transform(video)  # default [33, 3, 384, 640]
+        video = self._resize_crop_normalize_video(video)
 
-        video = video.permute(1, 0, 2, 3) # default [3, 33, 384, 640]
+        video = video.permute(0, 2, 1, 3, 4).contiguous() # default [num_views, 3, 9, H_out, W_out]
 
         # Proxy (from lerobot): 
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"] # default [32, D_action]
         proprio = sample["proprio"][:-1, :] # default [32, D_state]
-        if video.shape[1] <= 1:
+        if video.shape[2] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
-        if action.shape[0] % (video.shape[1] - 1) != 0:
+        if action.shape[0] % (video.shape[2] - 1) != 0:
             raise ValueError(
-                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[1] - 1}"
+                f"`action` horizon must be divisible by `video` transitions, got {action.shape[0]} and {video.shape[2] - 1}"
             )
 
         task = sample["instruction"]
@@ -252,13 +219,13 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         context_mask = torch.ones_like(context_mask)
         
         data = {
-            "video": video, # default [3, 33, 384, 640]
+            "video": video, # default [num_views, 3, 9, H_out, W_out]
             "action": action, # default [32, D_action]
             "proprio": proprio, # default [32, D_state]
             "prompt": instruction,
             "context": context, # default [128, D_context]
             "context_mask": context_mask, # default [128]
-            "image_is_pad": image_is_pad, # default [33]
+            "image_is_pad": image_is_pad, # default [9]
             "action_is_pad": sample["action_is_pad"], # default [32]
             "proprio_is_pad": sample["proprio_is_pad"], # default [33]
         }

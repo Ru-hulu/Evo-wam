@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Instantiate RobotVideoDataset and print one FAST-WAM-style sample or batch."""
+"""Smoke-test RobotVideoDataset and joint video/action adapter inputs."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG = REPO_ROOT / "Evo_1" / "configs" / "data" / "robotwin_smoke.json"
+sys.path.insert(0, str(REPO_ROOT))
 
 
 def _load_config(path: Path) -> dict[str, Any]:
@@ -101,7 +102,7 @@ def _build_dataset(dataset_cfg: dict[str, Any]) -> Any:
         action_video_freq_ratio=dataset_cfg.get("action_video_freq_ratio", 1),
         skip_padding_as_possible=dataset_cfg.get("skip_padding_as_possible", False),
         max_padding_retry=dataset_cfg.get("max_padding_retry", 3),
-        concat_multi_camera=dataset_cfg.get("concat_multi_camera", "horizontal"),
+        concat_multi_camera=dataset_cfg.get("concat_multi_camera"),
         override_instruction=dataset_cfg.get("override_instruction"),
     )
 
@@ -136,11 +137,15 @@ def _patch_fake_text_context(dataset: Any, context_len: int, context_dim: int) -
     dataset._get_cached_text_context = fake_context  # noqa: SLF001
 
 
+def _print_flat(item: dict[str, Any], prefix: str = "") -> None:
+    for key in sorted(item):
+        name = f"{prefix}.{key}" if prefix else key
+        print(f"{name}: {_describe_batch_value(item[key])}")
+
+
 def _print_sample(dataset: Any, idx: int) -> None:
-    # Call _get directly so missing text-cache/data errors stay precise.
     sample = dataset._get(idx)  # noqa: SLF001
-    for key in sorted(sample):
-        print(f"{key}: {_describe_value(sample[key])}")
+    _print_flat(sample)
 
 
 def _print_batches(
@@ -148,17 +153,13 @@ def _print_batches(
     batch_size: int,
     num_workers: int,
     num_batches: int,
-    shuffle: bool,
-    drop_last: bool,
 ) -> None:
     from torch.utils.data import DataLoader
 
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
         num_workers=num_workers,
-        drop_last=drop_last,
     )
     print(f"batch_size: {batch_size}")
     print(f"num_workers: {num_workers}")
@@ -166,44 +167,78 @@ def _print_batches(
         if batch_idx >= num_batches:
             break
         print(f"batch_idx: {batch_idx}")
-        for key in sorted(batch):
-            print(f"{key}: {_describe_batch_value(batch[key])}")
+        _print_flat(batch)
+
+
+class ShapeOnlyWanVAE:
+    """Shape-only VAE encoder for adapter smoke tests."""
+
+    def __init__(self, z_dim: int = 48, temporal_downsample_factor: int = 4, upsampling_factor: int = 16):
+        self.z_dim = int(z_dim)
+        self.temporal_downsample_factor = int(temporal_downsample_factor)
+        self.upsampling_factor = int(upsampling_factor)
+
+    def encode(self, videos, device, tiled: bool = False):
+        del tiled
+        import torch
+
+        if isinstance(videos, torch.Tensor):
+            video = videos
+        else:
+            video = torch.stack(list(videos), dim=0)
+        if video.ndim != 5:
+            raise ValueError(f"`video` must be [B, 3, T, H, W], got {tuple(video.shape)}")
+        batch_size, _, num_frames, height, width = video.shape
+        if height % self.upsampling_factor != 0 or width % self.upsampling_factor != 0:
+            raise ValueError(
+                "Video H/W must be divisible by fake VAE upsampling factor "
+                f"{self.upsampling_factor}, got {(height, width)}"
+            )
+        latent_t = (num_frames + self.temporal_downsample_factor - 1) // self.temporal_downsample_factor
+        return torch.zeros(
+            batch_size,
+            self.z_dim,
+            latent_t,
+            height // self.upsampling_factor,
+            width // self.upsampling_factor,
+            device=device,
+            dtype=video.dtype,
+        )
+
+
+def _describe_nested(prefix: str, value: Any) -> None:
+    if isinstance(value, dict):
+        for key in sorted(value):
+            _describe_nested(f"{prefix}.{key}" if prefix else key, value[key])
+        return
+    print(f"{prefix}: {_describe_batch_value(value)}")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--split", default="train")
-    parser.add_argument("--mode", choices=["sample", "batch"], default="sample")
+    parser.add_argument("--mode", choices=["adapter", "sample", "batch"], default="adapter")
     parser.add_argument("--idx", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--num-batches", type=int, default=1)
-    parser.add_argument("--shuffle", action="store_true")
-    parser.add_argument("--drop-last", action="store_true")
     parser.add_argument("--dataset-dir", action="append", default=None)
-    parser.add_argument("--pretrained-norm-stats", default=None)
-    parser.add_argument("--text-embedding-cache-dir", default=None)
-    parser.add_argument(
-        "--fake-context-dim",
-        type=int,
-        default=None,
-        help="Use zero text context with this feature dim instead of reading the text embedding cache.",
-    )
+    parser.add_argument("--fake-context-dim", type=int, default=None)
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
+    parser.add_argument("--vae-z-dim", type=int, default=48)
+    parser.add_argument("--vae-spatial-factor", type=int, default=16)
+    parser.add_argument("--vae-temporal-factor", type=int, default=4)
     args = parser.parse_args()
-
-    sys.path.insert(0, str(REPO_ROOT))
 
     cfg = _load_config(args.config)
     if args.split not in cfg:
         raise KeyError(f"Split `{args.split}` not found in {args.config}. Available: {sorted(cfg)}")
+
     dataset_cfg = cfg[args.split]
     if args.dataset_dir is not None:
         dataset_cfg["dataset_dirs"] = args.dataset_dir
-    if args.pretrained_norm_stats is not None:
-        dataset_cfg["pretrained_norm_stats"] = args.pretrained_norm_stats
-    if args.text_embedding_cache_dir is not None:
-        dataset_cfg["text_embedding_cache_dir"] = args.text_embedding_cache_dir
 
     dataset = _build_dataset(dataset_cfg)
     if args.fake_context_dim is not None:
@@ -217,15 +252,62 @@ def main() -> int:
 
     if args.mode == "sample":
         _print_sample(dataset, args.idx)
-    else:
+        return 0
+
+    if args.mode == "batch":
         _print_batches(
             dataset=dataset,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             num_batches=args.num_batches,
-            shuffle=args.shuffle,
-            drop_last=args.drop_last,
         )
+        return 0
+
+    import torch
+    from torch.utils.data import DataLoader
+
+    from Evo_1.training.model_input_adapter import (
+        FastWAMContextBuilder,
+        prepare_joint_model_inputs,
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+    )
+    batch = next(iter(dataloader))
+    dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
+
+    state_dim = int(batch["proprio"].shape[-1])
+    context_dim = int(batch["context"].shape[-1])
+    context_builder = FastWAMContextBuilder(state_dim=state_dim, context_dim=context_dim)
+    fake_vae = ShapeOnlyWanVAE(
+        z_dim=args.vae_z_dim,
+        temporal_downsample_factor=args.vae_temporal_factor,
+        upsampling_factor=args.vae_spatial_factor,
+    )
+
+    prepared = prepare_joint_model_inputs(
+        batch=batch,
+        vae=fake_vae,
+        context_builder=context_builder,
+        device=args.device,
+        dtype=dtype,
+    )
+
+    print(f"batch_size: {args.batch_size}")
+    _print_flat(batch, prefix="batch")
+    print("adapter:")
+    _describe_nested("video_inputs", prepared.video_inputs)
+    _describe_nested("action_inputs", prepared.action_inputs)
+    _describe_nested("targets", prepared.targets)
+    _describe_nested("context_inputs", prepared.context_inputs)
+    _describe_nested("debug", prepared.debug)
+    for key in sorted(prepared.mot_counts):
+        print(f"mot_counts.{key}: {prepared.mot_counts[key]}")
+    for key in sorted(prepared.masks):
+        print(f"masks.{key}: {_describe_value(prepared.masks[key])}")
     return 0
 
 
