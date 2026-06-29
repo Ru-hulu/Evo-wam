@@ -1,0 +1,94 @@
+{
+  "train": {
+    "_dimension_notes": {
+      "raw_shape": "[C, H, W] 原始单相机帧尺寸；这里只记录数据源 RGB 图像的原始通道/高/宽。",
+      "shape": "[C, H, W] FastWAMProcessor 中每个单相机帧经过图像 transform 后的尺寸。",
+      "processor.*_transforms Resize.size": "[H, W] 单相机 resize 目标尺寸；应和 shape_meta.images[].shape 的 H/W 对齐。",
+      "video_size": "[H, W] 三视角拼接后，最终送入视频专家的视频帧尺寸。"
+    },
+    "dataset_dirs": [
+      "./data/robotwin2.0/robotwin2.0"
+    ],
+    "shape_meta": {
+      "images": [
+        {
+          "key": "cam_high",
+          "raw_shape": [3, 480, 640],
+          "shape": [3, 240, 320]
+        },
+        {
+          "key": "cam_left_wrist",
+          "raw_shape": [3, 480, 640],
+          "shape": [3, 240, 320]
+        },
+        {
+          "key": "cam_right_wrist",
+          "raw_shape": [3, 480, 640],
+          "shape": [3, 240, 320]
+        }
+      ],
+      "action": [
+        {
+          "key": "default",
+          "raw_shape": 14,
+          "shape": 14
+        }
+      ],
+      "state": [
+        {
+          "key": "default",
+          "raw_shape": 14,
+          "shape": 14
+        }
+      ]
+    },
+    "num_frames": 33,
+    "global_sample_stride": 1,
+    "action_video_freq_ratio": 4,
+    "video_size_comment": "[H, W] 最终视频专家输入尺寸；robotwin 拼接会形成 384x320 的单帧。",
+    "video_size": [384, 320],
+    "camera_key": null,
+    "val_set_proportion": 0.01,
+    "is_training_set": true,
+    "pretrained_norm_stats": null,
+    "skip_padding_as_possible": false,
+    "max_padding_retry": 3,
+    "concat_multi_camera": "robotwin",
+    "text_embedding_cache_dir": "./data/text_embeds_cache/robotwin",
+    "context_len": 128,
+    "processor": {
+      "num_output_cameras": 3,
+      "action_output_dim": 14,
+      "proprio_output_dim": 14,
+      "action_state_transforms": null,
+      "use_stepwise_action_norm": false,
+      "norm_default_mode": "z-score",
+      "norm_exception_mode": null,
+      "delta_action_dim_mask": null,
+      "action_state_merger": {
+        "action_target_dim": 14,
+        "state_target_dim": 14
+      },
+      "_train_resize_comment": "[H, W] 训练时每个单相机帧先 resize 到 240x320；shape_meta.images[].shape 是 [3, 240, 320]。",
+      "train_transforms": [
+        {
+          "target": "Evo_1.data.lerobot.transforms.image.ToTensor"
+        },
+        {
+          "target": "torchvision.transforms.Resize",
+          "size": [240, 320]
+        }
+      ],
+      "_val_resize_comment": "[H, W] 验证时每个单相机帧使用同样的 resize 尺寸，保证 train/val 输入一致。",
+      "val_transforms": [
+        {
+          "target": "Evo_1.data.lerobot.transforms.image.ToTensor"
+        },
+        {
+          "target": "torchvision.transforms.Resize",
+          "size": [240, 320]
+        }
+      ]
+    }
+  }
+}

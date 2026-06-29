@@ -132,7 +132,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
             processor.set_normalizer_from_stats(dataset_stats)
             self.lerobot_dataset.set_processor(processor)
-        
+
     def __len__(self):
         return len(self.lerobot_dataset)
 

@@ -225,7 +225,7 @@ class FastWAMProcessor(BaseProcessor):
                 image = trans(image)
             
             meta_shape = [self.num_obs_steps] + shape
-            assert image.shape == meta_shape, \
+            assert list(image.shape) == meta_shape, \
                 f"Expected shape {meta_shape}, got {image.shape} after transforms for key {key}"
 
             processed_images.append(image)

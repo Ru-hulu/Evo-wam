@@ -30,6 +30,7 @@ import datasets
 import jsonlines
 import numpy as np
 import packaging.version
+import pyarrow.parquet as pq
 import torch
 from datasets.table import embed_table_storage
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi
@@ -51,10 +52,10 @@ from functools import partial
 DEFAULT_CHUNK_SIZE = 1000  # Max number of episodes per chunk
 
 INFO_PATH = "meta/info.json"
-EPISODES_PATH = "meta/episodes.jsonl"
+EPISODES_PATH = "meta/episodes/chunk-*/file-*.parquet"
 STATS_PATH = "meta/stats.json"
-EPISODES_STATS_PATH = "meta/episodes_stats.jsonl"
-TASKS_PATH = "meta/tasks.jsonl"
+EPISODES_STATS_PATH = EPISODES_PATH
+TASKS_PATH = "meta/tasks.parquet"
 
 ANNOTATION_PATHS = {
     "subtask": "annotations/subtask_annotations.jsonl",
@@ -66,8 +67,8 @@ ANNOTATION_PATHS = {
     "eef_direction": "annotations/eef_direction_annotation.jsonl",
 }
 
-DEFAULT_VIDEO_PATH = "videos/chunk-{episode_chunk:03d}/{video_key}/episode_{episode_index:06d}.mp4"
-DEFAULT_PARQUET_PATH = "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet"
+DEFAULT_VIDEO_PATH = "videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4"
+DEFAULT_PARQUET_PATH = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
 DEFAULT_IMAGE_PATH = "images/{image_key}/episode_{episode_index:06d}/frame_{frame_index:06d}.jpeg"
 
 DATASET_CARD_TEMPLATE = """
@@ -218,16 +219,18 @@ def load_stats(local_dir: Path) -> dict[str, dict[str, np.ndarray]]:
 
 
 def write_task(task_index: int, task: dict, local_dir: Path):
-    task_dict = {
-        "task_index": task_index,
-        "task": task,
-    }
-    append_jsonlines(task_dict, local_dir / TASKS_PATH)
+    raise NotImplementedError("Writing LeRobot v3 parquet task metadata is not supported here.")
 
 
 def load_tasks(local_dir: Path) -> tuple[dict, dict]:
-    tasks = load_jsonlines(local_dir / TASKS_PATH)
-    tasks = {item["task_index"]: item["task"] for item in sorted(tasks, key=lambda x: x["task_index"])}
+    table = pq.read_table(local_dir / TASKS_PATH)
+    task_rows = table.to_pydict()
+    task_names = task_rows.get("task", task_rows.get("__index_level_0__"))
+    task_indices = task_rows["task_index"]
+    tasks = {
+        int(task_index): task
+        for task_index, task in sorted(zip(task_indices, task_names), key=lambda x: x[0])
+    }
     task_to_task_index = {task: task_index for task_index, task in tasks.items()}
     return tasks, task_to_task_index
 
@@ -240,33 +243,36 @@ def load_annotations(local_dir: Path) -> dict[str, dict[int, str]]:
     return annotations
 
 def write_episode(episode: dict, local_dir: Path):
-    append_jsonlines(episode, local_dir / EPISODES_PATH)
+    raise NotImplementedError("Writing LeRobot v3 parquet episode metadata is not supported here.")
 
 
 def load_episodes(local_dir: Path) -> dict:
-    episodes = load_jsonlines(local_dir / EPISODES_PATH)
+    episode_files = sorted(local_dir.glob(EPISODES_PATH))
+    if not episode_files:
+        raise FileNotFoundError(f"No LeRobot v3 episode parquet files found at {local_dir / EPISODES_PATH}")
+
+    episodes = []
+    for episode_file in episode_files:
+        episodes.extend(pq.read_table(episode_file).to_pylist())
     return {item["episode_index"]: item for item in sorted(episodes, key=lambda x: x["episode_index"])}
 
 
 def write_episode_stats(episode_index: int, episode_stats: dict, local_dir: Path):
-    # We wrap episode_stats in a dictionary since `episode_stats["episode_index"]`
-    # is a dictionary of stats and not an integer.
-    episode_stats = {"episode_index": episode_index, "stats": serialize_dict(episode_stats)}
-    append_jsonlines(episode_stats, local_dir / EPISODES_STATS_PATH)
+    raise NotImplementedError("Writing LeRobot v3 parquet episode stats is not supported here.")
 
 
 def load_episodes_stats(local_dir: Path) -> dict:
-    episodes_stats = load_jsonlines(local_dir / EPISODES_STATS_PATH)
-    return {
-        item["episode_index"]: cast_stats_to_numpy(item["stats"])
-        for item in sorted(episodes_stats, key=lambda x: x["episode_index"])
-    }
-
-
-def backward_compatible_episodes_stats(
-    stats: dict[str, dict[str, np.ndarray]], episodes: list[int]
-) -> dict[str, dict[str, np.ndarray]]:
-    return dict.fromkeys(episodes, stats)
+    episodes_stats = {}
+    for episode_file in sorted(local_dir.glob(EPISODES_STATS_PATH)):
+        for row in pq.read_table(episode_file).to_pylist():
+            stats = {}
+            for key, value in row.items():
+                if not key.startswith("stats/"):
+                    continue
+                _, feature_key, stat_key = key.split("/", 2)
+                stats.setdefault(feature_key, {})[stat_key] = np.asarray(value)
+            episodes_stats[int(row["episode_index"])] = stats
+    return episodes_stats
 
 
 def load_image_as_numpy(
