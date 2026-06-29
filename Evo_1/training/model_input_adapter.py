@@ -101,12 +101,49 @@ def _build_flow_training_inputs(
     return noised, target, noise, timestep
 
 
+def _build_video_expert_training_inputs(
+    view_latents: torch.Tensor,
+    scheduler: WanContinuousFlowMatchScheduler,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    high_latents = view_latents[:, 0]  # default [B, C_latent, T_latent, H_latent, W_latent]
+    left_latents = view_latents[:, 1]  # default [B, C_latent, T_latent, H_latent, W_latent]
+    right_latents = view_latents[:, 2]  # default [B, C_latent, T_latent, H_latent, W_latent]
+
+    current_latents = torch.stack(
+        [
+            high_latents[:, :, 0],
+            left_latents[:, :, 0],
+            right_latents[:, :, 0],
+        ],
+        dim=2,
+    )  # default [B, C_latent, 3, H_latent, W_latent]
+    future_high_latents = high_latents[:, :, 1:]  # default [B, C_latent, T_future, H_latent, W_latent]
+
+    noise_future = torch.randn_like(future_high_latents)
+    timestep = scheduler.sample_training_t(
+        future_high_latents.shape[0],
+        device=future_high_latents.device,
+        dtype=future_high_latents.dtype,
+    )  # default [B]
+    noised_future = scheduler.add_noise(future_high_latents, noise_future, timestep)
+    target_future = noise_future - future_high_latents  # default [B, C_latent, T_future, H_latent, W_latent]
+
+    video_inputs = torch.cat([current_latents, noised_future], dim=2)
+    # default [B, C_latent, 3+T_future, H_latent, W_latent]
+    video_targets = torch.cat([torch.zeros_like(current_latents), target_future], dim=2)
+    # TODO 这里的目标实际上没那么简单，我们要加入新的监督。
+    # default [B, C_latent, 3+T_future, H_latent, W_latent]
+    video_noise = torch.cat([torch.zeros_like(current_latents), noise_future], dim=2)
+    # default [B, C_latent, 3+T_future, H_latent, W_latent]
+    return video_inputs, video_targets, target_future, video_noise, timestep
+
+
 def _infer_mot_counts(
-    video_latents: torch.Tensor,
+    video_tokens: torch.Tensor,
     action: torch.Tensor,
     video_patch_size: tuple[int, int, int],
 ) -> dict[str, int]:
-    _, num_views, _, latent_t, latent_h, latent_w = video_latents.shape  # default [B, V, C_latent, T_latent, H_latent, W_latent]
+    _, _, latent_t, latent_h, latent_w = video_tokens.shape  # default [B, C_latent, 3+T_future, H_latent, W_latent]
     if action.ndim != 3:
         raise ValueError(f"`action` must be [B, H_action, D_action], got {tuple(action.shape)}")
     _, patch_h, patch_w = video_patch_size
@@ -115,19 +152,14 @@ def _infer_mot_counts(
             f"Latent H/W must be divisible by video patch H/W, got {(latent_h, latent_w)} and {(patch_h, patch_w)}"
         )
     tokens_per_view_frame = (latent_h // patch_h) * (latent_w // patch_w)
-    tokens_per_latent_frame = num_views * tokens_per_view_frame
     return {
-        "current_obs_token_counts": tokens_per_latent_frame,
-        "future_obs_token_counts": max(latent_t - 1, 0) * tokens_per_latent_frame,
+        "current_obs_token_counts": 3 * tokens_per_view_frame,
+        "future_obs_token_counts": max(latent_t - 3, 0) * tokens_per_view_frame,
         "action_token_counts": int(action.shape[1]),
-        "num_video_views": int(num_views),
-        "tokens_per_latent_frame": tokens_per_latent_frame,
+        "num_current_video_views": 3,
+        "tokens_per_latent_frame": tokens_per_view_frame,
         "tokens_per_view_frame": tokens_per_view_frame,
     }
-
-
-def _future_video_latents(video_latents: torch.Tensor) -> torch.Tensor:
-    return video_latents[:, :, :, 1:]  # default [B, V, C_latent, T_future, H_latent, W_latent]
 
 
 def prepare_joint_model_inputs(
@@ -161,10 +193,9 @@ def prepare_joint_model_inputs(
         dtype=dtype,
         tiled=tiled_vae,
     )  # default [B, V, C_latent, T_latent, H_latent, W_latent]
-    noised_video_latents, target_video, noise_video, timestep_video = _build_flow_training_inputs(
+    noised_video_latents, target_video, target_future_video, noise_video, timestep_video = _build_video_expert_training_inputs(
         input_latents, video_scheduler
     )
-    noised_video_latents[:, :, :, 0:1] = input_latents[:, :, :, 0:1]  # default [B, V, C_latent, 1, H_latent, W_latent]
 
     action = batch["action"].to(device=device, dtype=dtype, non_blocking=True)  # default [B, H_action, D_action]
     noised_action, target_action, noise_action, timestep_action = _build_flow_training_inputs(
@@ -193,7 +224,7 @@ def prepare_joint_model_inputs(
         action_inputs=action_inputs,
         targets={
             "video": target_video,
-            "future_video": _future_video_latents(target_video),
+            "future_video": target_future_video,
             "action": target_action,
         },
         masks={
@@ -207,7 +238,7 @@ def prepare_joint_model_inputs(
             "state_token": context_out["state_token"],
             "current_state": context_out["current_state"],
         },
-        mot_counts=_infer_mot_counts(input_latents, action, video_patch_size),
+        mot_counts=_infer_mot_counts(noised_video_latents, action, video_patch_size),
         debug={
             "selected_video": selected_video,
             "input_latents": input_latents,
