@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Instantiate RobotVideoDataset and print one FAST-WAM-style sample."""
+"""Instantiate RobotVideoDataset and print one FAST-WAM-style sample or batch."""
 
 from __future__ import annotations
 
@@ -114,14 +114,82 @@ def _describe_value(value: Any) -> str:
     return type(value).__name__
 
 
+def _describe_batch_value(value: Any) -> str:
+    if isinstance(value, list):
+        if len(value) == 0:
+            return "list(len=0)"
+        first = value[0]
+        if isinstance(first, str):
+            return f"list[str](len={len(value)}, first_len={len(first)})"
+        return f"list(len={len(value)}, first={type(first).__name__})"
+    return _describe_value(value)
+
+
+def _patch_fake_text_context(dataset: Any, context_len: int, context_dim: int) -> None:
+    import torch
+
+    def fake_context(_prompt: str):
+        context = torch.zeros(context_len, context_dim)  # default [128, D_context]
+        context_mask = torch.ones(context_len, dtype=torch.bool)  # default [128]
+        return context, context_mask
+
+    dataset._get_cached_text_context = fake_context  # noqa: SLF001
+
+
+def _print_sample(dataset: Any, idx: int) -> None:
+    # Call _get directly so missing text-cache/data errors stay precise.
+    sample = dataset._get(idx)  # noqa: SLF001
+    for key in sorted(sample):
+        print(f"{key}: {_describe_value(sample[key])}")
+
+
+def _print_batches(
+    dataset: Any,
+    batch_size: int,
+    num_workers: int,
+    num_batches: int,
+    shuffle: bool,
+    drop_last: bool,
+) -> None:
+    from torch.utils.data import DataLoader
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last,
+    )
+    print(f"batch_size: {batch_size}")
+    print(f"num_workers: {num_workers}")
+    for batch_idx, batch in enumerate(dataloader):
+        if batch_idx >= num_batches:
+            break
+        print(f"batch_idx: {batch_idx}")
+        for key in sorted(batch):
+            print(f"{key}: {_describe_batch_value(batch[key])}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--split", default="train")
+    parser.add_argument("--mode", choices=["sample", "batch"], default="sample")
     parser.add_argument("--idx", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--num-batches", type=int, default=1)
+    parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--drop-last", action="store_true")
     parser.add_argument("--dataset-dir", action="append", default=None)
     parser.add_argument("--pretrained-norm-stats", default=None)
     parser.add_argument("--text-embedding-cache-dir", default=None)
+    parser.add_argument(
+        "--fake-context-dim",
+        type=int,
+        default=None,
+        help="Use zero text context with this feature dim instead of reading the text embedding cache.",
+    )
     args = parser.parse_args()
 
     sys.path.insert(0, str(REPO_ROOT))
@@ -138,12 +206,26 @@ def main() -> int:
         dataset_cfg["text_embedding_cache_dir"] = args.text_embedding_cache_dir
 
     dataset = _build_dataset(dataset_cfg)
+    if args.fake_context_dim is not None:
+        _patch_fake_text_context(
+            dataset,
+            context_len=dataset_cfg.get("context_len", 128),
+            context_dim=args.fake_context_dim,
+        )
+
     print(f"dataset_len: {len(dataset)}")
 
-    # Call _get directly so missing text-cache/data errors stay precise.
-    sample = dataset._get(args.idx)  # noqa: SLF001
-    for key in sorted(sample):
-        print(f"{key}: {_describe_value(sample[key])}")
+    if args.mode == "sample":
+        _print_sample(dataset, args.idx)
+    else:
+        _print_batches(
+            dataset=dataset,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            num_batches=args.num_batches,
+            shuffle=args.shuffle,
+            drop_last=args.drop_last,
+        )
     return 0
 
 
