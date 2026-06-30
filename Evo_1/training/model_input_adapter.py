@@ -11,7 +11,7 @@ from Evo_1.model.wan22.schedulers.scheduler_continuous import WanContinuousFlowM
 
 @dataclass
 class JointInputAdapterOutput:
-    video_inputs: dict[str, torch.Tensor | bool | None]
+    video_inputs: dict[str, torch.Tensor | bool | int | None]
     action_inputs: dict[str, torch.Tensor]
     targets: dict[str, torch.Tensor]
     masks: dict[str, torch.Tensor | None]
@@ -202,11 +202,13 @@ def prepare_joint_model_inputs(
         action, action_scheduler
     )
 
-    video_inputs: dict[str, torch.Tensor | bool | None] = {
+    mot_counts = _infer_mot_counts(noised_video_latents, action, video_patch_size)
+    video_inputs: dict[str, torch.Tensor | bool | int | None] = {
         "x": noised_video_latents,
         "timestep": timestep_video,
         "context": cross_context,
         "context_mask": cross_context_mask,
+        "current_obs_token_counts": mot_counts["current_obs_token_counts"],
         "fuse_vae_embedding_in_latents": True,
     }
     if condition_video_on_action:
@@ -238,7 +240,7 @@ def prepare_joint_model_inputs(
             "state_token": context_out["state_token"],
             "current_state": context_out["current_state"],
         },
-        mot_counts=_infer_mot_counts(noised_video_latents, action, video_patch_size),
+        mot_counts=mot_counts,
         debug={
             "selected_video": selected_video,
             "input_latents": input_latents,

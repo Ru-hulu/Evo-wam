@@ -499,6 +499,7 @@ class WanVideoDiT(torch.nn.Module):
         video_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        current_obs_token_counts: int,
     ) -> torch.Tensor:
         if video_seq_len <= 0:
             raise ValueError(f"`video_seq_len` must be positive, got {video_seq_len}")
@@ -524,8 +525,8 @@ class WanVideoDiT(torch.nn.Module):
 
         if self.video_attention_mask_mode == "first_frame_causal":
             video_mask = torch.ones((video_seq_len, video_seq_len), dtype=torch.bool, device=device)
-            first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-            video_mask[:first_frame_tokens, first_frame_tokens:] = False
+            current_obs_tokens = int(current_obs_token_counts)
+            video_mask[:current_obs_tokens, current_obs_tokens:] = False
             return video_mask
 
         raise ValueError(f"Unsupported video attention mask mode: {self.video_attention_mask_mode}")
@@ -535,6 +536,7 @@ class WanVideoDiT(torch.nn.Module):
         x: torch.Tensor,  # e.g. 9-frame 384x320 video -> [B, 48, 3, 24, 20]
         timestep: torch.Tensor,  # [B]
         context: torch.Tensor,  # [B, text_len, 4096], text_len usually <= 128 in FastWAM config
+        current_obs_token_counts: int,  # default 3 * tokens_per_frame for h0,l0,r0
         context_mask: Optional[torch.Tensor] = None,  # [B, text_len]
         action: Optional[torch.Tensor] = None,  # [B, action_horizon, action_dim], only used when action_conditioned=True
         fuse_vae_embedding_in_latents: Optional[bool] = None,  # FastWAM/Wan2.2 default: True
@@ -649,6 +651,7 @@ class WanVideoDiT(torch.nn.Module):
             "meta": {
                 "grid_size": (f, h, w),
                 "tokens_per_frame": tokens_per_frame,
+                "current_obs_token_counts": current_obs_token_counts,
             },
         }
 
@@ -743,6 +746,7 @@ class WanVideoDiT(torch.nn.Module):
         x: torch.Tensor,  # 9-frame 384x320 video -> [B, 48, 3, 24, 20] 这里已经是VAE的输出了
         timestep: torch.Tensor,  # [B] 去噪过程的某一个时间步
         context: torch.Tensor,  # [B, text_len, 4096] 机器人状态、文本编码
+        current_obs_token_counts: int,  # default 3 * tokens_per_frame for h0,l0,r0
         context_mask: Optional[torch.Tensor] = None,  # [B, text_len]
         action: Optional[torch.Tensor] = None,  # [B, action_horizon, action_dim], only used when action_conditioned=True
         fuse_vae_embedding_in_latents: Optional[bool] = None,  # FastWAM/Wan2.2 default: True
@@ -753,6 +757,7 @@ class WanVideoDiT(torch.nn.Module):
             timestep=timestep,
             context=context,
             context_mask=context_mask,
+            current_obs_token_counts=current_obs_token_counts,
             action=action,
             fuse_vae_embedding_in_latents=fuse_vae_embedding_in_latents,
         )
@@ -765,6 +770,7 @@ class WanVideoDiT(torch.nn.Module):
             video_seq_len=x_tokens.shape[1],
             video_tokens_per_frame=int(pre_state["meta"]["tokens_per_frame"]),
             device=x_tokens.device,
+            current_obs_token_counts=pre_state["meta"]["current_obs_token_counts"],
         ) if self.video_attention_mask_mode != "bidirectional" else None # special rule for faster speed
 
         x_tokens = self.run_dit_blocks(

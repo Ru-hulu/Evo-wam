@@ -234,6 +234,9 @@ def _assert_adapter_contract(batch: dict[str, Any], prepared: Any) -> None:
     assert mot_counts["current_obs_token_counts"] == 3 * mot_counts["tokens_per_view_frame"], (
         "current_obs_token_counts must cover h0,l0,r0"
     )
+    assert prepared.video_inputs["current_obs_token_counts"] == mot_counts["current_obs_token_counts"], (
+        "video_inputs.current_obs_token_counts must match mot_counts"
+    )
     assert mot_counts["future_obs_token_counts"] == future_video.shape[2] * mot_counts["tokens_per_view_frame"], (
         "future_obs_token_counts must cover only future h frames"
     )

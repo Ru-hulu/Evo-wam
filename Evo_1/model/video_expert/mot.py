@@ -245,4 +245,5 @@ class SkipLayerVideoActionMoT(nn.Module):
             video_seq_len=video_tokens.shape[1],
             video_tokens_per_frame=int(video_pre_state["meta"]["tokens_per_frame"]),
             device=video_tokens.device,
+            current_obs_token_counts=video_pre_state["meta"]["current_obs_token_counts"],
         )
