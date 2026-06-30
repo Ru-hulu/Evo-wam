@@ -214,6 +214,32 @@ def _describe_nested(prefix: str, value: Any) -> None:
     print(f"{prefix}: {_describe_batch_value(value)}")
 
 
+def _assert_adapter_contract(batch: dict[str, Any], prepared: Any) -> None:
+    video = batch["video"]
+    video_inputs = prepared.video_inputs["x"]
+    future_video = prepared.targets["future_video"]
+    input_latents = prepared.debug["input_latents"]
+    mot_counts = prepared.mot_counts
+
+    assert video.ndim == 6, f"batch.video must be [B, V, 3, T, H, W], got {tuple(video.shape)}"
+    assert video.shape[1] == 3, f"batch.video must have 3 views [h,l,r], got {video.shape[1]}"
+    assert video_inputs.ndim == 5, f"video_inputs.x must be [B, C, S, H, W], got {tuple(video_inputs.shape)}"
+    assert future_video.ndim == 5, f"targets.future_video must be [B, C, T_future, H, W], got {tuple(future_video.shape)}"
+    assert input_latents.ndim == 6, f"debug.input_latents must be [B, V, C, T, H, W], got {tuple(input_latents.shape)}"
+    assert input_latents.shape[1] == 3, f"debug.input_latents must have 3 views [h,l,r], got {input_latents.shape[1]}"
+    assert video_inputs.shape[2] == 3 + future_video.shape[2], (
+        "video_inputs.x token frames must be h0,l0,r0 plus future h frames, "
+        f"got {video_inputs.shape[2]} and future {future_video.shape[2]}"
+    )
+    assert mot_counts["current_obs_token_counts"] == 3 * mot_counts["tokens_per_view_frame"], (
+        "current_obs_token_counts must cover h0,l0,r0"
+    )
+    assert mot_counts["future_obs_token_counts"] == future_video.shape[2] * mot_counts["tokens_per_view_frame"], (
+        "future_obs_token_counts must cover only future h frames"
+    )
+    print("adapter_contract: ok")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -295,6 +321,7 @@ def main() -> int:
         device=args.device,
         dtype=dtype,
     )
+    _assert_adapter_contract(batch, prepared)
 
     print(f"batch_size: {args.batch_size}")
     _print_flat(batch, prefix="batch")
