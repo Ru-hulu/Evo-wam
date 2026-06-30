@@ -217,7 +217,9 @@ def _describe_nested(prefix: str, value: Any) -> None:
 def _assert_adapter_contract(batch: dict[str, Any], prepared: Any) -> None:
     video = batch["video"]
     video_inputs = prepared.video_inputs["x"]
+    action_inputs = prepared.action_inputs
     future_video = prepared.targets["future_video"]
+    target_action = prepared.targets["action"]
     input_latents = prepared.debug["input_latents"]
     mot_counts = prepared.mot_counts
 
@@ -240,14 +242,129 @@ def _assert_adapter_contract(batch: dict[str, Any], prepared: Any) -> None:
     assert mot_counts["future_obs_token_counts"] == future_video.shape[2] * mot_counts["tokens_per_view_frame"], (
         "future_obs_token_counts must cover only future h frames"
     )
+    assert action_inputs["action_seq"].shape == target_action.shape, (
+        f"action_inputs.action_seq must match target action shape, got {tuple(action_inputs['action_seq'].shape)} "
+        f"and {tuple(target_action.shape)}"
+    )
+    assert action_inputs["fused_tokens"].shape == prepared.context_inputs["context"].shape, (
+        "action_inputs.fused_tokens must reuse adapter context tokens"
+    )
+    assert action_inputs["state"].shape == prepared.context_inputs["current_state"].shape, (
+        "action_inputs.state must reuse current proprio state"
+    )
+    assert action_inputs["embodiment_id"].shape == (target_action.shape[0],), (
+        f"action_inputs.embodiment_id must be [B], got {tuple(action_inputs['embodiment_id'].shape)}"
+    )
     print("adapter_contract: ok")
+
+
+def _build_tiny_video_expert(args: argparse.Namespace, context_dim: int):
+    from Evo_1.model.video_expert.wan_video_dit import WanVideoDiT
+
+    return WanVideoDiT(
+        hidden_dim=args.mot_hidden_dim,
+        in_dim=args.vae_z_dim,
+        ffn_dim=args.mot_hidden_dim * args.mot_ffn_mult,
+        out_dim=args.vae_z_dim,
+        text_dim=context_dim,
+        freq_dim=args.mot_freq_dim,
+        eps=1e-6,
+        patch_size=(1, 2, 2),
+        num_heads=args.mot_num_heads,
+        attn_head_dim=args.mot_attn_head_dim,
+        num_layers=args.mot_video_layers,
+        has_image_input=False,
+        has_image_pos_emb=False,
+        has_ref_conv=False,
+        seperated_timestep=True,
+        require_vae_embedding=False,
+        require_clip_embedding=False,
+        fuse_vae_embedding_in_latents=True,
+        action_conditioned=False,
+        video_attention_mask_mode="first_frame_causal",
+    )
+
+
+def _build_tiny_action_expert(args: argparse.Namespace, context_dim: int, action_horizon: int, action_dim: int):
+    from Evo_1.model.action_head.dit_action_head import FlowmatchingDiTActionHead
+
+    return FlowmatchingDiTActionHead(
+        embed_dim=context_dim,
+        hidden_dim=args.mot_hidden_dim,
+        ffn_dim=args.mot_hidden_dim * args.mot_ffn_mult,
+        action_dim=action_horizon * action_dim,
+        horizon=action_horizon,
+        per_action_dim=action_dim,
+        num_heads=args.mot_num_heads,
+        attn_head_dim=args.mot_attn_head_dim,
+        num_layers=args.mot_action_layers,
+        freq_dim=args.mot_freq_dim,
+        max_position=max(1024, action_horizon),
+    )
+
+
+def _assert_mot_contract(prepared: Any, outputs: dict[str, Any]) -> None:
+    assert outputs["video"].shape == prepared.targets["video"].shape, (
+        f"mot video output must match video target shape, got {tuple(outputs['video'].shape)} "
+        f"and {tuple(prepared.targets['video'].shape)}"
+    )
+    assert outputs["action"].shape == prepared.targets["action"].shape, (
+        f"mot action output must match action target shape, got {tuple(outputs['action'].shape)} "
+        f"and {tuple(prepared.targets['action'].shape)}"
+    )
+    assert outputs["video_tokens"].shape[1] == (
+        prepared.mot_counts["current_obs_token_counts"] + prepared.mot_counts["future_obs_token_counts"]
+    ), "mot video token count must match current + future video counts"
+    assert outputs["action_tokens"].shape[1] == prepared.mot_counts["action_token_counts"], (
+        "mot action token count must match action_token_counts"
+    )
+    print("mot_contract: ok")
+
+
+def _run_mot_smoke(args: argparse.Namespace, prepared: Any, dtype: Any) -> dict[str, Any]:
+    import torch
+
+    from Evo_1.model.video_expert.mot import SkipLayerVideoActionMoT
+
+    context_dim = int(prepared.action_inputs["fused_tokens"].shape[-1])
+    action_horizon = int(prepared.action_inputs["action_seq"].shape[1])
+    action_dim = int(prepared.action_inputs["action_seq"].shape[2])
+
+    video_expert = _build_tiny_video_expert(args, context_dim=context_dim).to(device=args.device, dtype=dtype)
+    action_expert = _build_tiny_action_expert(
+        args,
+        context_dim=context_dim,
+        action_horizon=action_horizon,
+        action_dim=action_dim,
+    ).to(device=args.device, dtype=dtype)
+    mot = SkipLayerVideoActionMoT(
+        num_heads=args.mot_num_heads,
+        video_layer_stride=args.mot_video_layer_stride,
+    ).to(device=args.device)
+
+    video_expert.eval()
+    action_expert.eval()
+    mot.eval()
+    with torch.no_grad():
+        outputs = mot(
+            video_expert=video_expert,
+            action_expert=action_expert,
+            video_inputs=prepared.video_inputs,
+            action_inputs=prepared.action_inputs,
+            current_obs_token_counts=prepared.mot_counts["current_obs_token_counts"],
+            future_obs_token_counts=prepared.mot_counts["future_obs_token_counts"],
+            action_token_counts=prepared.mot_counts["action_token_counts"],
+        )
+
+    _assert_mot_contract(prepared, outputs)
+    return outputs
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--split", default="train")
-    parser.add_argument("--mode", choices=["adapter", "sample", "batch"], default="adapter")
+    parser.add_argument("--mode", choices=["adapter", "sample", "batch", "mot"], default="adapter")
     parser.add_argument("--idx", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -259,6 +376,14 @@ def main() -> int:
     parser.add_argument("--vae-z-dim", type=int, default=48)
     parser.add_argument("--vae-spatial-factor", type=int, default=16)
     parser.add_argument("--vae-temporal-factor", type=int, default=4)
+    parser.add_argument("--mot-hidden-dim", type=int, default=64)
+    parser.add_argument("--mot-ffn-mult", type=int, default=4)
+    parser.add_argument("--mot-num-heads", type=int, default=4)
+    parser.add_argument("--mot-attn-head-dim", type=int, default=16)
+    parser.add_argument("--mot-freq-dim", type=int, default=16)
+    parser.add_argument("--mot-video-layers", type=int, default=2)
+    parser.add_argument("--mot-action-layers", type=int, default=1)
+    parser.add_argument("--mot-video-layer-stride", type=int, default=2)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -325,6 +450,15 @@ def main() -> int:
         dtype=dtype,
     )
     _assert_adapter_contract(batch, prepared)
+
+    if args.mode == "mot":
+        outputs = _run_mot_smoke(args, prepared, dtype=dtype)
+        print(f"batch_size: {args.batch_size}")
+        print("mot:")
+        _describe_nested("outputs", outputs)
+        for key in sorted(prepared.mot_counts):
+            print(f"mot_counts.{key}: {prepared.mot_counts[key]}")
+        return 0
 
     print(f"batch_size: {args.batch_size}")
     _print_flat(batch, prefix="batch")

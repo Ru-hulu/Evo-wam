@@ -214,11 +214,13 @@ def prepare_joint_model_inputs(
     if condition_video_on_action:
         video_inputs["action"] = action
 
+    embodiment_id = torch.zeros(action.shape[0], dtype=torch.long, device=action.device)  # default [B]
     action_inputs = {
-        "action_tokens": noised_action,
-        "timestep": timestep_action,
-        "context": cross_context,
-        "context_mask": cross_context_mask,
+        "action_seq": noised_action,  # default [B, H_action, D_action]
+        "timestep": timestep_action,  # default [B]
+        "fused_tokens": cross_context,  # default [B, L+1, D_context]
+        "state": context_out["current_state"].to(device=device, dtype=dtype),  # default [B, D_state]
+        "embodiment_id": embodiment_id,  # default [B]
     }
 
     return JointInputAdapterOutput(
