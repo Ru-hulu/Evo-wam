@@ -127,7 +127,7 @@ def _describe_batch_value(value: Any) -> str:
 
 
 class ShapeOnlyWanVAE:
-    """Shape-only VAE encoder for adapter smoke tests."""
+    """Shape-only VAE encoder for smoke tests."""
 
     def __init__(self, z_dim: int = 48, temporal_downsample_factor: int = 4, upsampling_factor: int = 16):
         self.z_dim = int(z_dim)
@@ -240,14 +240,14 @@ def _build_tiny_joint_models(args: argparse.Namespace, model_cfg: dict[str, Any]
         action_horizon=int(model_cfg["action_horizon"]),
         action_dim=int(model_cfg["action_dim"]),
         vae_z_dim=int(model_cfg["vae_z_dim"]),
-        hidden_dim=args.mot_hidden_dim,
-        ffn_mult=args.mot_ffn_mult,
-        num_heads=args.mot_num_heads,
-        attn_head_dim=args.mot_attn_head_dim,
-        freq_dim=args.mot_freq_dim,
-        video_layers=args.mot_video_layers,
-        action_layers=args.mot_action_layers,
-        video_layer_stride=args.mot_video_layer_stride,
+        hidden_dim=int(model_cfg["hidden_dim"]),
+        ffn_mult=int(model_cfg["ffn_mult"]),
+        num_heads=int(model_cfg["num_heads"]),
+        attn_head_dim=int(model_cfg["attn_head_dim"]),
+        freq_dim=int(model_cfg["freq_dim"]),
+        video_layers=int(model_cfg["video_layers"]),
+        action_layers=int(model_cfg["action_layers"]),
+        video_layer_stride=int(model_cfg["video_layer_stride"]),
         device=args.device,
         dtype=dtype,
     )
@@ -298,18 +298,6 @@ def main() -> int:
     parser.add_argument("--dataset-dir", action="append", default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
-    parser.add_argument("--vae-spatial-factor", type=int, default=16)
-    parser.add_argument("--vae-temporal-factor", type=int, default=4)
-    parser.add_argument("--mot-hidden-dim", type=int, default=64)
-    parser.add_argument("--mot-ffn-mult", type=int, default=4)
-    parser.add_argument("--mot-num-heads", type=int, default=4)
-    parser.add_argument("--mot-attn-head-dim", type=int, default=24)
-    parser.add_argument("--mot-freq-dim", type=int, default=16)
-    parser.add_argument("--mot-video-layers", type=int, default=2)
-    parser.add_argument("--mot-action-layers", type=int, default=1)
-    parser.add_argument("--mot-video-layer-stride", type=int, default=2)
-    parser.add_argument("--train-lr", type=float, default=1e-4)
-    parser.add_argument("--max-steps", type=int, default=1)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -337,24 +325,27 @@ def main() -> int:
     dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
 
     model_cfg = dataset_cfg["model"]
+    vae_cfg = dataset_cfg["vae"]
+    training_cfg = dataset_cfg["training"]
     state_dim = int(model_cfg["state_dim"])
     context_dim = int(model_cfg["context_dim"])
     vae_z_dim = int(model_cfg["vae_z_dim"])
     context_builder = FastWAMContextBuilder(state_dim=state_dim, context_dim=context_dim)
     fake_vae = ShapeOnlyWanVAE(
         z_dim=vae_z_dim,
-        temporal_downsample_factor=args.vae_temporal_factor,
-        upsampling_factor=args.vae_spatial_factor,
+        temporal_downsample_factor=int(vae_cfg["temporal_factor"]),
+        upsampling_factor=int(vae_cfg["spatial_factor"]),
     )
 
-    if args.max_steps <= 0:
-        raise ValueError(f"`max_steps` must be positive, got {args.max_steps}")
+    max_steps = int(training_cfg["max_steps"])
+    if max_steps <= 0:
+        raise ValueError(f"`max_steps` must be positive, got {max_steps}")
     from Evo_1.training.joint_trainer import joint_parameters
 
     video_expert, action_expert, mot = _build_tiny_joint_models(args, model_cfg, dtype)
-    optimizer = torch.optim.AdamW(joint_parameters(video_expert, action_expert, mot), lr=args.train_lr)
+    optimizer = torch.optim.AdamW(joint_parameters(video_expert, action_expert, mot), lr=float(training_cfg["lr"]))
     dataloader_iter = iter(dataloader)
-    for step_idx in range(args.max_steps):
+    for step_idx in range(max_steps):
         try:
             batch = next(dataloader_iter)
         except StopIteration:
@@ -366,7 +357,7 @@ def main() -> int:
         print(f"train_step_idx: {step_idx}")
         _describe_nested("outputs", outputs)
     print(f"batch_size: {args.batch_size}")
-    print(f"max_steps: {args.max_steps}")
+    print(f"max_steps: {max_steps}")
     return 0
 
 

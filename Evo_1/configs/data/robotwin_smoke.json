@@ -5,7 +5,9 @@
       "shape": "[C, H, W] FastWAMProcessor 中每个单相机帧经过图像 transform 后的尺寸。",
       "processor.*_transforms Resize.size": "[H, W] 单相机 resize 目标尺寸；应和 shape_meta.images[].shape 的 H/W 对齐。",
       "video_size": "[H, W] 三视角拼接后，最终送入视频专家的视频帧尺寸。",
-      "model": "训练模型结构维度；用于建动作专家、视频专家和 state/context token，不从第一个 batch 推断。"
+      "model": "训练模型结构维度；用于建动作专家、视频专家和 state/context token，不从第一个 batch 推断。",
+      "vae": "当前 smoke 使用的 ShapeOnlyWanVAE 尺寸参数；后续替换真实 VAE 时对应真实 VAE 配置。",
+      "training": "训练 smoke 的优化和步数参数。"
     },
     "dataset_dirs": [
       "./data/robotwin2.0/robotwin2.0"
@@ -62,7 +64,23 @@
       "action_dim": 14,
       "action_horizon": 32,
       "context_dim": 4096,
-      "vae_z_dim": 48
+      "vae_z_dim": 48,
+      "hidden_dim": 64,
+      "ffn_mult": 4,
+      "num_heads": 4,
+      "attn_head_dim": 24,
+      "freq_dim": 16,
+      "video_layers": 2,
+      "action_layers": 1,
+      "video_layer_stride": 2
+    },
+    "vae": {
+      "spatial_factor": 16,
+      "temporal_factor": 4
+    },
+    "training": {
+      "lr": 0.0001,
+      "max_steps": 1
     },
     "processor": {
       "num_output_cameras": 3,
