@@ -4,7 +4,8 @@
       "raw_shape": "[C, H, W] 原始单相机帧尺寸；这里只记录数据源 RGB 图像的原始通道/高/宽。",
       "shape": "[C, H, W] FastWAMProcessor 中每个单相机帧经过图像 transform 后的尺寸。",
       "processor.*_transforms Resize.size": "[H, W] 单相机 resize 目标尺寸；应和 shape_meta.images[].shape 的 H/W 对齐。",
-      "video_size": "[H, W] 三视角拼接后，最终送入视频专家的视频帧尺寸。"
+      "video_size": "[H, W] 三视角拼接后，最终送入视频专家的视频帧尺寸。",
+      "model": "训练模型结构维度；用于建动作专家、视频专家和 state/context token，不从第一个 batch 推断。"
     },
     "dataset_dirs": [
       "./data/robotwin2.0/robotwin2.0"
@@ -56,6 +57,13 @@
     "concat_multi_camera": "robotwin",
     "text_embedding_cache_dir": "./data/text_embeds_cache/robotwin",
     "context_len": 128,
+    "model": {
+      "state_dim": 14,
+      "action_dim": 14,
+      "action_horizon": 32,
+      "context_dim": 4096,
+      "vae_z_dim": 48
+    },
     "processor": {
       "num_output_cameras": 3,
       "action_output_dim": 14,

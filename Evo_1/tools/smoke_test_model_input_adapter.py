@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke-test RobotVideoDataset and joint video/action adapter inputs."""
+"""Smoke-test a minimal joint video/action training step."""
 
 from __future__ import annotations
 
@@ -126,23 +126,6 @@ def _describe_batch_value(value: Any) -> str:
     return _describe_value(value)
 
 
-def _patch_fake_text_context(dataset: Any, context_len: int, context_dim: int) -> None:
-    import torch
-
-    def fake_context(_prompt: str):
-        context = torch.zeros(context_len, context_dim)  # default [128, D_context]
-        context_mask = torch.ones(context_len, dtype=torch.bool)  # default [128]
-        return context, context_mask
-
-    dataset._get_cached_text_context = fake_context  # noqa: SLF001
-
-
-def _print_flat(item: dict[str, Any], prefix: str = "") -> None:
-    for key in sorted(item):
-        name = f"{prefix}.{key}" if prefix else key
-        print(f"{name}: {_describe_batch_value(item[key])}")
-
-
 class ShapeOnlyWanVAE:
     """Shape-only VAE encoder for adapter smoke tests."""
 
@@ -249,17 +232,14 @@ def _assert_mot_contract(prepared: Any, outputs: dict[str, Any]) -> None:
     print("mot_contract: ok")
 
 
-def _build_tiny_joint_models(args: argparse.Namespace, prepared: Any, dtype: Any):
+def _build_tiny_joint_models(args: argparse.Namespace, model_cfg: dict[str, Any], dtype: Any):
     from Evo_1.training.joint_trainer import JointModelConfig, build_joint_models
 
-    context_dim = int(prepared.action_inputs["fused_tokens"].shape[-1])
-    action_horizon = int(prepared.action_inputs["action_seq"].shape[1])
-    action_dim = int(prepared.action_inputs["action_seq"].shape[2])
     config = JointModelConfig(
-        context_dim=context_dim,
-        action_horizon=action_horizon,
-        action_dim=action_dim,
-        vae_z_dim=args.vae_z_dim,
+        context_dim=int(model_cfg["context_dim"]),
+        action_horizon=int(model_cfg["action_horizon"]),
+        action_dim=int(model_cfg["action_dim"]),
+        vae_z_dim=int(model_cfg["vae_z_dim"]),
         hidden_dim=args.mot_hidden_dim,
         ffn_mult=args.mot_ffn_mult,
         num_heads=args.mot_num_heads,
@@ -274,12 +254,15 @@ def _build_tiny_joint_models(args: argparse.Namespace, prepared: Any, dtype: Any
     return build_joint_models(config)
 
 
-def _run_train_step_smoke(args: argparse.Namespace, prepared: Any, dtype: Any) -> dict[str, Any]:
-    import torch
-    from Evo_1.training.joint_trainer import detach_train_step_result, joint_parameters, train_one_step
+def _run_train_step_smoke(
+    video_expert: Any,
+    action_expert: Any,
+    mot: Any,
+    optimizer: Any,
+    prepared: Any,
+) -> dict[str, Any]:
+    from Evo_1.training.joint_trainer import detach_train_step_result, train_one_step
 
-    video_expert, action_expert, mot = _build_tiny_joint_models(args, prepared, dtype)
-    optimizer = torch.optim.AdamW(joint_parameters(video_expert, action_expert, mot), lr=args.train_lr)
     result = train_one_step(
         video_expert=video_expert,
         action_expert=action_expert,
@@ -292,18 +275,29 @@ def _run_train_step_smoke(args: argparse.Namespace, prepared: Any, dtype: Any) -
     return detach_train_step_result(result)
 
 
+def _prepare_inputs_for_batch(args: argparse.Namespace, batch: dict[str, Any], context_builder: Any, fake_vae: Any, dtype: Any):
+    from Evo_1.training.model_input_adapter import prepare_joint_model_inputs
+
+    prepared = prepare_joint_model_inputs(
+        batch=batch,
+        vae=fake_vae,
+        context_builder=context_builder,
+        device=args.device,
+        dtype=dtype,
+    )
+    _assert_adapter_contract(batch, prepared)
+    return prepared
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--split", default="train")
-    parser.add_argument("--mode", choices=["adapter", "train-step"], default="adapter")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--dataset-dir", action="append", default=None)
-    parser.add_argument("--fake-context-dim", type=int, default=None)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--dtype", choices=["float32", "bfloat16"], default="float32")
-    parser.add_argument("--vae-z-dim", type=int, default=48)
     parser.add_argument("--vae-spatial-factor", type=int, default=16)
     parser.add_argument("--vae-temporal-factor", type=int, default=4)
     parser.add_argument("--mot-hidden-dim", type=int, default=64)
@@ -315,6 +309,7 @@ def main() -> int:
     parser.add_argument("--mot-action-layers", type=int, default=1)
     parser.add_argument("--mot-video-layer-stride", type=int, default=2)
     parser.add_argument("--train-lr", type=float, default=1e-4)
+    parser.add_argument("--max-steps", type=int, default=1)
     args = parser.parse_args()
 
     cfg = _load_config(args.config)
@@ -326,70 +321,52 @@ def main() -> int:
         dataset_cfg["dataset_dirs"] = args.dataset_dir
 
     dataset = _build_dataset(dataset_cfg)
-    if args.fake_context_dim is not None:
-        _patch_fake_text_context(
-            dataset,
-            context_len=dataset_cfg.get("context_len", 128),
-            context_dim=args.fake_context_dim,
-        )
 
     print(f"dataset_len: {len(dataset)}")
 
     import torch
     from torch.utils.data import DataLoader
 
-    from Evo_1.training.model_input_adapter import (
-        FastWAMContextBuilder,
-        prepare_joint_model_inputs,
-    )
+    from Evo_1.training.model_input_adapter import FastWAMContextBuilder
 
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
-    batch = next(iter(dataloader))
-    dtype = torch.float32 if args.dtype == "float32" else torch.bfloat16
+    dtype = {"float32": torch.float32, "bfloat16": torch.bfloat16}[args.dtype]
 
-    state_dim = int(batch["proprio"].shape[-1])
-    context_dim = int(batch["context"].shape[-1])
+    model_cfg = dataset_cfg["model"]
+    state_dim = int(model_cfg["state_dim"])
+    context_dim = int(model_cfg["context_dim"])
+    vae_z_dim = int(model_cfg["vae_z_dim"])
     context_builder = FastWAMContextBuilder(state_dim=state_dim, context_dim=context_dim)
     fake_vae = ShapeOnlyWanVAE(
-        z_dim=args.vae_z_dim,
+        z_dim=vae_z_dim,
         temporal_downsample_factor=args.vae_temporal_factor,
         upsampling_factor=args.vae_spatial_factor,
     )
 
-    prepared = prepare_joint_model_inputs(
-        batch=batch,
-        vae=fake_vae,
-        context_builder=context_builder,
-        device=args.device,
-        dtype=dtype,
-    )
-    _assert_adapter_contract(batch, prepared)
+    if args.max_steps <= 0:
+        raise ValueError(f"`max_steps` must be positive, got {args.max_steps}")
+    from Evo_1.training.joint_trainer import joint_parameters
 
-    if args.mode == "train-step":
-        outputs = _run_train_step_smoke(args, prepared, dtype=dtype)
-        print(f"batch_size: {args.batch_size}")
-        print("train_step:")
+    video_expert, action_expert, mot = _build_tiny_joint_models(args, model_cfg, dtype)
+    optimizer = torch.optim.AdamW(joint_parameters(video_expert, action_expert, mot), lr=args.train_lr)
+    dataloader_iter = iter(dataloader)
+    for step_idx in range(args.max_steps):
+        try:
+            batch = next(dataloader_iter)
+        except StopIteration:
+            dataloader_iter = iter(dataloader)
+            batch = next(dataloader_iter)
+        prepared = _prepare_inputs_for_batch(args, batch, context_builder, fake_vae, dtype)
+
+        outputs = _run_train_step_smoke(video_expert, action_expert, mot, optimizer, prepared)
+        print(f"train_step_idx: {step_idx}")
         _describe_nested("outputs", outputs)
-        for key in sorted(prepared.mot_counts):
-            print(f"mot_counts.{key}: {prepared.mot_counts[key]}")
-        return 0
-
     print(f"batch_size: {args.batch_size}")
-    _print_flat(batch, prefix="batch")
-    print("adapter:")
-    _describe_nested("video_inputs", prepared.video_inputs)
-    _describe_nested("action_inputs", prepared.action_inputs)
-    _describe_nested("targets", prepared.targets)
-    _describe_nested("context_inputs", prepared.context_inputs)
-    _describe_nested("debug", prepared.debug)
-    for key in sorted(prepared.mot_counts):
-        print(f"mot_counts.{key}: {prepared.mot_counts[key]}")
-    for key in sorted(prepared.masks):
-        print(f"masks.{key}: {_describe_value(prepared.masks[key])}")
+    print(f"max_steps: {args.max_steps}")
     return 0
 
 
