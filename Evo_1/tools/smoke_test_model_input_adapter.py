@@ -143,33 +143,6 @@ def _print_flat(item: dict[str, Any], prefix: str = "") -> None:
         print(f"{name}: {_describe_batch_value(item[key])}")
 
 
-def _print_sample(dataset: Any, idx: int) -> None:
-    sample = dataset._get(idx)  # noqa: SLF001
-    _print_flat(sample)
-
-
-def _print_batches(
-    dataset: Any,
-    batch_size: int,
-    num_workers: int,
-    num_batches: int,
-) -> None:
-    from torch.utils.data import DataLoader
-
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )
-    print(f"batch_size: {batch_size}")
-    print(f"num_workers: {num_workers}")
-    for batch_idx, batch in enumerate(dataloader):
-        if batch_idx >= num_batches:
-            break
-        print(f"batch_idx: {batch_idx}")
-        _print_flat(batch)
-
-
 class ShapeOnlyWanVAE:
     """Shape-only VAE encoder for adapter smoke tests."""
 
@@ -258,51 +231,6 @@ def _assert_adapter_contract(batch: dict[str, Any], prepared: Any) -> None:
     print("adapter_contract: ok")
 
 
-def _build_tiny_video_expert(args: argparse.Namespace, context_dim: int):
-    from Evo_1.model.video_expert.wan_video_dit import WanVideoDiT
-
-    return WanVideoDiT(
-        hidden_dim=args.mot_hidden_dim,
-        in_dim=args.vae_z_dim,
-        ffn_dim=args.mot_hidden_dim * args.mot_ffn_mult,
-        out_dim=args.vae_z_dim,
-        text_dim=context_dim,
-        freq_dim=args.mot_freq_dim,
-        eps=1e-6,
-        patch_size=(1, 2, 2),
-        num_heads=args.mot_num_heads,
-        attn_head_dim=args.mot_attn_head_dim,
-        num_layers=args.mot_video_layers,
-        has_image_input=False,
-        has_image_pos_emb=False,
-        has_ref_conv=False,
-        seperated_timestep=True,
-        require_vae_embedding=False,
-        require_clip_embedding=False,
-        fuse_vae_embedding_in_latents=True,
-        action_conditioned=False,
-        video_attention_mask_mode="first_frame_causal",
-    )
-
-
-def _build_tiny_action_expert(args: argparse.Namespace, context_dim: int, action_horizon: int, action_dim: int):
-    from Evo_1.model.action_head.dit_action_head import FlowmatchingDiTActionHead
-
-    return FlowmatchingDiTActionHead(
-        embed_dim=context_dim,
-        hidden_dim=args.mot_hidden_dim,
-        ffn_dim=args.mot_hidden_dim * args.mot_ffn_mult,
-        action_dim=action_horizon * action_dim,
-        horizon=action_horizon,
-        per_action_dim=action_dim,
-        num_heads=args.mot_num_heads,
-        attn_head_dim=args.mot_attn_head_dim,
-        num_layers=args.mot_action_layers,
-        freq_dim=args.mot_freq_dim,
-        max_position=max(1024, action_horizon),
-    )
-
-
 def _assert_mot_contract(prepared: Any, outputs: dict[str, Any]) -> None:
     assert outputs["video"].shape == prepared.targets["video"].shape, (
         f"mot video output must match video target shape, got {tuple(outputs['video'].shape)} "
@@ -321,99 +249,56 @@ def _assert_mot_contract(prepared: Any, outputs: dict[str, Any]) -> None:
     print("mot_contract: ok")
 
 
-def _build_tiny_joint_stack(args: argparse.Namespace, prepared: Any, dtype: Any):
-    from Evo_1.model.video_expert.mot import SkipLayerVideoActionMoT
+def _build_tiny_joint_models(args: argparse.Namespace, prepared: Any, dtype: Any):
+    from Evo_1.training.joint_trainer import JointModelConfig, build_joint_models
 
     context_dim = int(prepared.action_inputs["fused_tokens"].shape[-1])
     action_horizon = int(prepared.action_inputs["action_seq"].shape[1])
     action_dim = int(prepared.action_inputs["action_seq"].shape[2])
-
-    video_expert = _build_tiny_video_expert(args, context_dim=context_dim).to(device=args.device, dtype=dtype)
-    action_expert = _build_tiny_action_expert(
-        args,
+    config = JointModelConfig(
         context_dim=context_dim,
         action_horizon=action_horizon,
         action_dim=action_dim,
-    ).to(device=args.device, dtype=dtype)
-    mot = SkipLayerVideoActionMoT(
+        vae_z_dim=args.vae_z_dim,
+        hidden_dim=args.mot_hidden_dim,
+        ffn_mult=args.mot_ffn_mult,
         num_heads=args.mot_num_heads,
+        attn_head_dim=args.mot_attn_head_dim,
+        freq_dim=args.mot_freq_dim,
+        video_layers=args.mot_video_layers,
+        action_layers=args.mot_action_layers,
         video_layer_stride=args.mot_video_layer_stride,
-    ).to(device=args.device)
-    return video_expert, action_expert, mot
-
-
-def _run_mot_forward(mot: Any, video_expert: Any, action_expert: Any, prepared: Any) -> dict[str, Any]:
-    return mot(
-        video_expert=video_expert,
-        action_expert=action_expert,
-        video_inputs=prepared.video_inputs,
-        action_inputs=prepared.action_inputs,
-        current_obs_token_counts=prepared.mot_counts["current_obs_token_counts"],
-        future_obs_token_counts=prepared.mot_counts["future_obs_token_counts"],
-        action_token_counts=prepared.mot_counts["action_token_counts"],
+        device=args.device,
+        dtype=dtype,
     )
-
-
-def _run_mot_smoke(args: argparse.Namespace, prepared: Any, dtype: Any) -> dict[str, Any]:
-    import torch
-
-    video_expert, action_expert, mot = _build_tiny_joint_stack(args, prepared, dtype)
-    video_expert.eval()
-    action_expert.eval()
-    mot.eval()
-    with torch.no_grad():
-        outputs = _run_mot_forward(mot, video_expert, action_expert, prepared)
-
-    _assert_mot_contract(prepared, outputs)
-    return outputs
+    return build_joint_models(config)
 
 
 def _run_train_step_smoke(args: argparse.Namespace, prepared: Any, dtype: Any) -> dict[str, Any]:
     import torch
-    import torch.nn.functional as F
+    from Evo_1.training.joint_trainer import detach_train_step_result, joint_parameters, train_one_step
 
-    video_expert, action_expert, mot = _build_tiny_joint_stack(args, prepared, dtype)
-    video_expert.train()
-    action_expert.train()
-    mot.train()
-
-    optimizer = torch.optim.AdamW(
-        list(video_expert.parameters()) + list(action_expert.parameters()) + list(mot.parameters()),
-        lr=args.train_lr,
+    video_expert, action_expert, mot = _build_tiny_joint_models(args, prepared, dtype)
+    optimizer = torch.optim.AdamW(joint_parameters(video_expert, action_expert, mot), lr=args.train_lr)
+    result = train_one_step(
+        video_expert=video_expert,
+        action_expert=action_expert,
+        mot=mot,
+        prepared=prepared,
+        optimizer=optimizer,
     )
-    optimizer.zero_grad(set_to_none=True)
-
-    outputs = _run_mot_forward(mot, video_expert, action_expert, prepared)
-    _assert_mot_contract(prepared, outputs)
-
-    pred_future_video = outputs["video"][:, :, 3:]  # default [B, C_latent, T_future, H_latent, W_latent]
-    video_loss = F.mse_loss(pred_future_video.float(), prepared.targets["future_video"].float())
-    action_loss = F.mse_loss(outputs["action"].float(), prepared.targets["action"].float())
-    total_loss = video_loss + action_loss
-    if not bool(torch.isfinite(total_loss).item()):
-        raise ValueError(f"train-step loss must be finite, got {float(total_loss.detach().cpu())}")
-    total_loss.backward()
-    optimizer.step()
+    _assert_mot_contract(prepared, result["outputs"])
     print("train_step_contract: ok")
-
-    return {
-        "video": outputs["video"].detach(),
-        "action": outputs["action"].detach(),
-        "loss": total_loss.detach(),
-        "video_loss": video_loss.detach(),
-        "action_loss": action_loss.detach(),
-    }
+    return detach_train_step_result(result)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--split", default="train")
-    parser.add_argument("--mode", choices=["adapter", "sample", "batch", "mot", "train-step"], default="adapter")
-    parser.add_argument("--idx", type=int, default=0)
+    parser.add_argument("--mode", choices=["adapter", "train-step"], default="adapter")
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--num-batches", type=int, default=1)
     parser.add_argument("--dataset-dir", action="append", default=None)
     parser.add_argument("--fake-context-dim", type=int, default=None)
     parser.add_argument("--device", default="cpu")
@@ -450,19 +335,6 @@ def main() -> int:
 
     print(f"dataset_len: {len(dataset)}")
 
-    if args.mode == "sample":
-        _print_sample(dataset, args.idx)
-        return 0
-
-    if args.mode == "batch":
-        _print_batches(
-            dataset=dataset,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            num_batches=args.num_batches,
-        )
-        return 0
-
     import torch
     from torch.utils.data import DataLoader
 
@@ -496,15 +368,6 @@ def main() -> int:
         dtype=dtype,
     )
     _assert_adapter_contract(batch, prepared)
-
-    if args.mode == "mot":
-        outputs = _run_mot_smoke(args, prepared, dtype=dtype)
-        print(f"batch_size: {args.batch_size}")
-        print("mot:")
-        _describe_nested("outputs", outputs)
-        for key in sorted(prepared.mot_counts):
-            print(f"mot_counts.{key}: {prepared.mot_counts[key]}")
-        return 0
 
     if args.mode == "train-step":
         outputs = _run_train_step_smoke(args, prepared, dtype=dtype)
